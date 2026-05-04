@@ -1,0 +1,78 @@
+# Local-dev orchestration. The Supabase stack is run separately via `supabase start`
+# (which manages its own docker-compose); this file owns the application services that
+# sit alongside it: Redis, the FastAPI service, the Arq worker, and exec-rs.
+#
+# Usage:
+#   supabase start              # one-shot: brings up Postgres, Auth, Storage on :54321
+#   docker compose -f infra/compose/docker-compose.yml up --build
+#   docker compose -f infra/compose/docker-compose.yml down
+
+name: cts
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    container_name: cts-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api-ai:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api-ai.Dockerfile
+    container_name: cts-api-ai
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      SUPABASE_URL: http://host.docker.internal:54321
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-replace-me}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-replace-me}
+      OPENROUTER_MODEL_PRIMARY: deepseek/deepseek-v4-pro
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz').read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  api-ai-worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/api-ai.Dockerfile
+    container_name: cts-api-ai-worker
+    command: ["arq", "api_ai.worker.WorkerSettings"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      SUPABASE_URL: http://host.docker.internal:54321
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-replace-me}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ../..
+      dockerfile: infra/docker/web.Dockerfile
+    container_name: cts-web
+    environment:
+      NEXT_PUBLIC_SUPABASE_URL: http://localhost:54321
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-replace-me}
+      API_AI_BASE_URL: http://api-ai:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      api-ai:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12

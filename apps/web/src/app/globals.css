@@ -1,0 +1,17 @@
+:root {
+  color-scheme: light dark;
+  --bg: #fafafa;
+  --fg: #0a0a0a;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0a0a0a; --fg: #fafafa; }
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter Tight", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}

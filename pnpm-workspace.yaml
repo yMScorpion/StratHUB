@@ -1,0 +1,5 @@
+packages:
+  - "apps/web"
+  - "packages/strategy-spec/ts"
+  - "packages/ui"
+  - "packages/sdk"

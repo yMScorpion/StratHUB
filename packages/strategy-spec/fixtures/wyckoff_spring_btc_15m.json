@@ -1,0 +1,64 @@
+{
+  "spec_version": "1.0.0",
+  "asset_class": "perp",
+  "exchange": "binance",
+  "symbols": ["BTCUSDT"],
+  "timeframe": "15m",
+  "indicators": [
+    { "id": "atr14", "kind": "atr", "params": { "length": 14 } },
+    { "id": "vol_ma20", "kind": "volume_ma", "params": { "length": 20 } }
+  ],
+  "patterns": [
+    { "id": "wy_spring", "kind": "wyckoff_spring", "params": { "lookback": 50, "penetration_atr": 0.5 } },
+    { "id": "vsa_no_supply", "kind": "vsa_no_supply", "params": { "vol_ratio_max": 0.7 } },
+    { "id": "ob_demand", "kind": "order_block", "params": { "side": "demand", "lookback": 30 } }
+  ],
+  "filters": [
+    { "kind": "session", "params": { "tz": "UTC", "window": "00-23" } },
+    { "kind": "max_spread_bps", "params": { "value": 5 } }
+  ],
+  "entries": [
+    {
+      "side": "long",
+      "when": "wy_spring && vsa_no_supply",
+      "size": { "kind": "risk_pct", "value": "0.5" },
+      "max_concurrent_per_symbol": 1
+    }
+  ],
+  "exits": [
+    { "kind": "stop_atr", "params": { "atr_id": "atr14", "mult": 1.5 } },
+    { "kind": "tp_rr", "params": { "rr": 3.0 } },
+    { "kind": "trailing", "params": { "mode": "order_block", "ref_id": "ob_demand" } }
+  ],
+  "risk": {
+    "model": "fixed_pct",
+    "per_trade_pct": "0.5",
+    "max_concurrent": 3,
+    "max_daily_loss_pct": "2.0",
+    "min_rr": "3.0"
+  },
+  "citations": [
+    {
+      "rule_ref": "patterns[0]",
+      "pdf_id": "00000000-0000-0000-0000-000000000001",
+      "pages": [42, 43, 44],
+      "quote": "Spring de Wyckoff: rompimento falso para baixo do range de acumulacao com volume baixo na penetracao."
+    },
+    {
+      "rule_ref": "patterns[1]",
+      "pdf_id": "00000000-0000-0000-0000-000000000001",
+      "pages": [88],
+      "quote": "No Supply Bar: barra de baixa com volume muito reduzido indica ausencia de oferta."
+    },
+    {
+      "rule_ref": "risk",
+      "pdf_id": "00000000-0000-0000-0000-000000000001",
+      "pages": [12],
+      "quote": "Operacoes apenas com risco/retorno minimo de 1:3."
+    }
+  ],
+  "metadata": {
+    "name": "Wyckoff Spring + VSA No-Supply (BTC 15m)",
+    "source": "fixture-golden"
+  }
+}

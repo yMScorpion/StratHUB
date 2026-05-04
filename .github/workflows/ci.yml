@@ -1,0 +1,118 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: rust (strategy-spec + exec-rs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --all-targets
+
+  python:
+    name: python (api-ai + strategy-spec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+      - run: uv python install 3.12
+      - name: strategy-spec — install + test
+        working-directory: packages/strategy-spec/py
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -e .
+          uv pip install --python .venv/bin/python pytest
+          .venv/bin/pytest -q
+      - name: api-ai — install + test
+        working-directory: apps/api-ai
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python -e .
+          uv pip install --python .venv/bin/python --group dev pytest pytest-asyncio
+          .venv/bin/pytest -q
+
+  node:
+    name: node (web + strategy-spec ts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install -g pnpm@9.15.0
+      - run: pnpm install --frozen-lockfile=false
+      - name: strategy-spec — typecheck + test
+        working-directory: packages/strategy-spec/ts
+        run: |
+          pnpm typecheck
+          node --test --import tsx src/index.test.ts
+      - name: web — typecheck
+        working-directory: apps/web
+        run: pnpm typecheck
+      - name: web — build
+        working-directory: apps/web
+        run: pnpm build
+
+  cross-language-hash-parity:
+    name: hash parity (canonicalization)
+    needs: [rust, python, node]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: test -s packages/strategy-spec/fixtures/wyckoff_spring_btc_15m.hash.txt
+
+  secret-scan:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  migration-review:
+    name: migration review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    env:
+      BASE_REF: ${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: deny destructive migrations on PR
+        run: |
+          set -e
+          # BASE_REF is sourced from GitHub's controlled branch namespace and is then
+          # only used as an argument to git, never embedded in shell metacharacters.
+          MIGS=$(git diff --name-only "origin/${BASE_REF}"... -- 'infra/supabase/migrations/*' || true)
+          if [ -z "$MIGS" ]; then
+            echo "no migration files changed"
+            exit 0
+          fi
+          if echo "$MIGS" | xargs -r grep -EHni 'drop[[:space:]]+table|truncate|delete[[:space:]]+from'; then
+            echo "::error::destructive migration detected — require explicit reviewer approval"
+            exit 1
+          fi
