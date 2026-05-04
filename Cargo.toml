@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/exec-rs",
+    "packages/strategy-spec/rs",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.86"
+license = "Proprietary"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+jsonschema = "0.28"
+sha2 = "0.10"
+hex = "0.4"
+rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+rust_decimal_macros = "1.36"
+thiserror = "2.0"
+anyhow = "1.0"
+tokio = { version = "1.42", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug = true

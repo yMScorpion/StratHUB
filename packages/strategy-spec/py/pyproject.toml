@@ -1,0 +1,36 @@
+[project]
+name = "strategy-spec"
+version = "0.1.0"
+description = "Canonical Strategy Spec — Python binding (Pydantic v2)."
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.10.0",
+    "jsonschema>=4.23.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["strategy_spec"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"../schema/strategy-spec.schema.json" = "strategy_spec/_schema.json"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "ruff>=0.8.0",
+    "mypy>=1.13.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "PL", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
