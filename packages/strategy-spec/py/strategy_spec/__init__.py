@@ -17,6 +17,7 @@ from .models import (
 from .validation import (
     SchemaValidationError,
     SemanticProblem,
+    get_schema,
     semantic_check,
     validate,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "Size",
     "StrategySpec",
     "canonicalize",
+    "get_schema",
     "hash_spec",
     "semantic_check",
     "validate",

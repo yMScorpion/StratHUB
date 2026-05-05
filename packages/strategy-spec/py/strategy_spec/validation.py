@@ -29,6 +29,11 @@ class SemanticProblem:
     path: str | None = None
 
 
+def get_schema() -> dict[str, Any]:
+    """Return the parsed JSON Schema for the Strategy Spec (public API)."""
+    return _load_schema()
+
+
 @cache
 def _load_schema() -> dict[str, Any]:
     # When installed as a wheel, the schema is force-included beside this module.

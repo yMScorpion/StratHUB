@@ -13,6 +13,11 @@ dependencies = [
     "redis>=5.2.0",
     "supabase>=2.10.0",
     "strategy-spec",
+    # Phase 2: ingestion pipeline
+    "pymupdf>=1.24.0",
+    "openai>=1.60.0",
+    "pytesseract>=0.3.13",
+    "Pillow>=10.0.0",
 ]
 
 [tool.uv.sources]
