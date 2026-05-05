@@ -35,6 +35,9 @@ jobs:
       - uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
+          cache-dependency-glob: |
+            apps/api-ai/pyproject.toml
+            packages/strategy-spec/py/pyproject.toml
       - run: uv python install 3.12
       - name: strategy-spec — install + test
         working-directory: packages/strategy-spec/py
