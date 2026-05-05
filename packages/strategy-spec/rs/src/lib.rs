@@ -232,12 +232,10 @@ fn tokens(when: &str) -> Vec<String> {
     for c in when.chars() {
         if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' {
             cur.push(c);
+        } else if !cur.is_empty() && cur.starts_with(|x: char| x.is_ascii_lowercase()) {
+            out.push(std::mem::take(&mut cur));
         } else {
-            if !cur.is_empty() && cur.starts_with(|x: char| x.is_ascii_lowercase()) {
-                out.push(std::mem::take(&mut cur));
-            } else {
-                cur.clear();
-            }
+            cur.clear();
         }
     }
     if !cur.is_empty() && cur.starts_with(|x: char| x.is_ascii_lowercase()) {
@@ -281,7 +279,9 @@ mod tests {
         let h2 = hash_spec(&v);
         assert_eq!(h1, h2);
         assert_eq!(h1.len(), 64);
-        assert!(h1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(h1
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]

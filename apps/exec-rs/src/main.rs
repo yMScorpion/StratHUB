@@ -52,7 +52,9 @@ struct Args {
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let args = Args::parse();
@@ -61,8 +63,8 @@ async fn main() -> Result<()> {
         anyhow::bail!("--account-id is required in paper and live modes");
     }
 
-    let raw = std::fs::read(&args.spec)
-        .with_context(|| format!("read spec {}", args.spec.display()))?;
+    let raw =
+        std::fs::read(&args.spec).with_context(|| format!("read spec {}", args.spec.display()))?;
     let spec: Value = serde_json::from_slice(&raw).context("parse spec JSON")?;
 
     validate(&spec).context("schema validation")?;
@@ -71,9 +73,7 @@ async fn main() -> Result<()> {
     let computed = hash_spec(&spec);
     if let Some(declared) = spec.get("spec_hash").and_then(Value::as_str) {
         if declared != computed {
-            anyhow::bail!(
-                "spec_hash mismatch: declared {declared}, computed {computed}"
-            );
+            anyhow::bail!("spec_hash mismatch: declared {declared}, computed {computed}");
         }
     }
 

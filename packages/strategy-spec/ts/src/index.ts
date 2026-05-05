@@ -46,14 +46,14 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCHEMA_PATH = path.resolve(__dirname, "../../schema/strategy-spec.schema.json");
 const schema = JSON.parse(readFileSync(SCHEMA_PATH, "utf8")) as object;
 
-const ajv = new Ajv2020.default({
+const ajv = new Ajv2020({
   allErrors: true,
   strict: true,
   allowUnionTypes: true,
   removeAdditional: false,
   useDefaults: false,
 });
-addFormats.default(ajv);
+addFormats(ajv);
 const compiledValidator = ajv.compile<StrategySpec>(schema);
 
 export type ValidationResult =
