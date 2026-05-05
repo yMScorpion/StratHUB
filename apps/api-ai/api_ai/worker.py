@@ -16,8 +16,5 @@ class WorkerSettings:
 
     functions = [noop]
     keep_result = 60
-
-    @classmethod
-    def redis_settings(cls) -> RedisSettings:
-        url = load_settings().redis_url
-        return RedisSettings.from_dsn(url)
+    # Must be a class-level attribute (not a classmethod) — arq reads it via class.__dict__.
+    redis_settings = RedisSettings.from_dsn(load_settings().redis_url)

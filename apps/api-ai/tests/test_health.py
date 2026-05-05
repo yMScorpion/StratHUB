@@ -44,3 +44,21 @@ def test_spec_validate_rejects_bad_per_trade_pct() -> None:
     r = client.post("/spec/validate", json=spec)
     assert r.status_code == 400
     assert r.json()["detail"]["kind"] == "schema"
+
+
+def test_spec_validate_rejects_bogus_declared_hash() -> None:
+    client = TestClient(create_app())
+    spec = json.loads(FIXTURE.read_text("utf-8"))
+    spec["spec_hash"] = "a" * 64  # valid hex format but wrong value
+    r = client.post("/spec/validate", json=spec)
+    assert r.status_code == 422
+    assert r.json()["detail"]["kind"] == "hash_mismatch"
+
+
+def test_spec_validate_rejects_invalid_uuid_pdf_id() -> None:
+    client = TestClient(create_app())
+    spec = json.loads(FIXTURE.read_text("utf-8"))
+    spec["citations"][0]["pdf_id"] = "not-a-uuid"
+    r = client.post("/spec/validate", json=spec)
+    assert r.status_code == 400
+    assert r.json()["detail"]["kind"] == "schema"

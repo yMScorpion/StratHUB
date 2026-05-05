@@ -65,7 +65,19 @@ def create_app() -> FastAPI:
                     ],
                 },
             )
-        return {"ok": True, "spec_hash": hash_spec(spec), "sealed": with_hash(spec)}
+        computed = hash_spec(spec)
+        declared = spec.get("spec_hash")
+        if declared is not None and declared != computed:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "kind": "hash_mismatch",
+                    "errors": [
+                        f"declared spec_hash {declared!r} does not match computed {computed!r}"
+                    ],
+                },
+            )
+        return {"ok": True, "spec_hash": computed, "sealed": with_hash(spec)}
 
     return app
 

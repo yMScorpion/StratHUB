@@ -10,7 +10,7 @@ from functools import cache
 from pathlib import Path
 from typing import Any
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 
 
@@ -51,7 +51,8 @@ def _load_schema() -> dict[str, Any]:
 
 @cache
 def _validator() -> Draft202012Validator:
-    return Draft202012Validator(_load_schema())
+    # FormatChecker enables validation of `format: uuid` (and others) declared in the schema.
+    return Draft202012Validator(_load_schema(), format_checker=FormatChecker())
 
 
 def validate(spec: dict[str, Any]) -> dict[str, Any]:
@@ -63,6 +64,70 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
 
 
 _ID_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
+_ARITHMETIC_RE = re.compile(r"[+\-*/%]")
+_FUNC_CALL_RE = re.compile(r"[a-z][a-z0-9_]*\s*\(")
+
+
+def _when_syntax_problems(when: str, index: int) -> list[SemanticProblem]:
+    """Check `when` expression syntax without resolving ids.
+
+    Allowed tokens: bareword ids, true/false, && || ! ( ).
+    Rejects: arithmetic operators, function calls, dangling binary ops, unbalanced parens.
+    """
+    path = f"entries[{index}].when"
+    problems: list[SemanticProblem] = []
+    stripped = when.strip()
+
+    if _ARITHMETIC_RE.search(when):
+        problems.append(SemanticProblem(
+            "invalid_when_syntax",
+            f"entries[{index}].when contains arithmetic operators "
+            "(only && || ! ( ) and ids are allowed)",
+            path,
+        ))
+
+    if _FUNC_CALL_RE.search(when):
+        problems.append(SemanticProblem(
+            "invalid_when_syntax",
+            f"entries[{index}].when contains a function call; only bareword ids are allowed",
+            path,
+        ))
+
+    if stripped.endswith("&&") or stripped.endswith("||"):
+        problems.append(SemanticProblem(
+            "invalid_when_syntax",
+            f"entries[{index}].when has a trailing binary operator",
+            path,
+        ))
+
+    if stripped.startswith("&&") or stripped.startswith("||"):
+        problems.append(SemanticProblem(
+            "invalid_when_syntax",
+            f"entries[{index}].when has a leading binary operator",
+            path,
+        ))
+
+    depth = 0
+    for c in when:
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth < 0:
+                problems.append(SemanticProblem(
+                    "invalid_when_syntax",
+                    f'entries[{index}].when has an unmatched ")"',
+                    path,
+                ))
+                depth = 0
+    if depth != 0:
+        problems.append(SemanticProblem(
+            "invalid_when_syntax",
+            f'entries[{index}].when has an unmatched "("',
+            path,
+        ))
+
+    return problems
 
 
 def semantic_check(spec: dict[str, Any]) -> list[SemanticProblem]:
@@ -82,7 +147,9 @@ def semantic_check(spec: dict[str, Any]) -> list[SemanticProblem]:
     known = set(indicator_ids) | set(pattern_ids)
     reserved = {"true", "false"}
     for i, entry in enumerate(spec.get("entries", [])):
-        for ref in _ID_RE.findall(entry["when"]):
+        when = entry["when"]
+        problems.extend(_when_syntax_problems(when, i))
+        for ref in _ID_RE.findall(when):
             if ref in reserved:
                 continue
             if ref not in known:
@@ -97,8 +164,12 @@ def semantic_check(spec: dict[str, Any]) -> list[SemanticProblem]:
     risk = spec.get("risk", {})
     if "min_rr" in risk:
         try:
-            if float(risk["min_rr"]) < 1:
-                problems.append(SemanticProblem("min_rr_below_one", "risk.min_rr must be >= 1", "risk.min_rr"))
+            if float(risk["min_rr"]) < 3.0:
+                problems.append(SemanticProblem(
+                    "min_rr_below_three",
+                    "risk.min_rr must be >= 3 (Apostila methodology requires >= 3)",
+                    "risk.min_rr",
+                ))
         except ValueError:
             pass
 
