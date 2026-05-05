@@ -89,11 +89,51 @@ pub fn validate(spec: &Value) -> Result<(), SpecError> {
 }
 
 /// Canonical JSON. Must match the TS and Python implementations byte-for-byte:
-/// recursively sorted object keys, no whitespace, ASCII-escaped, and integer-valued floats
-/// normalized to ints (matches JS Number semantics).
+/// recursively sorted object keys, no whitespace, UTF-8 strings (no \uXXXX escaping),
+/// positive scientific notation exponents normalised to include `+` (1e21 → 1e+21),
+/// and integer-valued floats normalised to ints (matches JS Number semantics).
 pub fn canonicalize(value: &Value) -> String {
     let normalized = normalize(value);
-    serde_json::to_string(&normalized).expect("serialization is infallible for normalized Value")
+    let raw = serde_json::to_string(&normalized)
+        .expect("serialization is infallible for normalized Value");
+    // serde_json/ryu omits the `+` sign on positive exponents (e.g. `1e21`),
+    // but both Python json.dumps and JS JSON.stringify emit `1e+21`. Fix that here.
+    fix_positive_exponents(raw)
+}
+
+/// Add `+` to bare positive scientific-notation exponents outside of JSON strings.
+/// serde_json uses ryu which outputs `1e21`; Python/JS output `1e+21`.
+fn fix_positive_exponents(s: String) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if escaped {
+            escaped = false;
+            out.push(c);
+            continue;
+        }
+        if c == '\\' && in_str {
+            escaped = true;
+            out.push(c);
+            continue;
+        }
+        if c == '"' {
+            in_str = !in_str;
+            out.push(c);
+            continue;
+        }
+        if c == 'e' && !in_str {
+            out.push(c);
+            if matches!(chars.peek(), Some('0'..='9')) {
+                out.push('+');
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn normalize(value: &Value) -> Value {
@@ -183,6 +223,7 @@ pub fn semantic_check(spec: &Value) -> Result<(), SpecError> {
     if let Some(entries) = spec.get("entries").and_then(|v| v.as_array()) {
         for (i, entry) in entries.iter().enumerate() {
             let when = entry.get("when").and_then(|v| v.as_str()).unwrap_or("");
+            check_when_syntax(when, i, &mut problems);
             for tok in tokens(when) {
                 if tok == "true" || tok == "false" {
                     continue;
@@ -204,10 +245,10 @@ pub fn semantic_check(spec: &Value) -> Result<(), SpecError> {
         .and_then(|v| v.as_str())
     {
         if let Ok(n) = min_rr.parse::<f64>() {
-            if n < 1.0 {
+            if n < 3.0 {
                 problems.push(SemanticProblem {
-                    code: "min_rr_below_one",
-                    message: "risk.min_rr must be >= 1".into(),
+                    code: "min_rr_below_three",
+                    message: "risk.min_rr must be >= 3 (Apostila methodology requires >= 3)".into(),
                     path: Some("risk.min_rr".into()),
                 });
             }
@@ -219,6 +260,100 @@ pub fn semantic_check(spec: &Value) -> Result<(), SpecError> {
     } else {
         Err(SpecError::Semantic(problems))
     }
+}
+
+/// Validate the boolean `when` expression syntax (does not check id existence).
+/// Allowed: bareword ids, `true`, `false`, `&&`, `||`, `!`, `(`, `)`.
+/// Rejected: arithmetic operators, function calls, dangling binary operators, unbalanced parens.
+fn check_when_syntax(when: &str, index: usize, problems: &mut Vec<SemanticProblem>) {
+    let path = format!("entries[{index}].when");
+    let stripped = when.trim();
+
+    if when
+        .chars()
+        .any(|c| matches!(c, '+' | '-' | '*' | '/' | '%'))
+    {
+        problems.push(SemanticProblem {
+            code: "invalid_when_syntax",
+            message: format!(
+                "entries[{index}].when contains arithmetic operators (only && || ! ( ) and ids are allowed)"
+            ),
+            path: Some(path.clone()),
+        });
+    }
+
+    if when_has_func_call(when) {
+        problems.push(SemanticProblem {
+            code: "invalid_when_syntax",
+            message: format!(
+                "entries[{index}].when contains a function call; only bareword ids are allowed"
+            ),
+            path: Some(path.clone()),
+        });
+    }
+
+    if stripped.ends_with("&&") || stripped.ends_with("||") {
+        problems.push(SemanticProblem {
+            code: "invalid_when_syntax",
+            message: format!("entries[{index}].when has a trailing binary operator"),
+            path: Some(path.clone()),
+        });
+    }
+
+    if stripped.starts_with("&&") || stripped.starts_with("||") {
+        problems.push(SemanticProblem {
+            code: "invalid_when_syntax",
+            message: format!("entries[{index}].when has a leading binary operator"),
+            path: Some(path.clone()),
+        });
+    }
+
+    let mut depth: i32 = 0;
+    let mut unmatched_close = false;
+    for c in when.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    problems.push(SemanticProblem {
+                        code: "invalid_when_syntax",
+                        message: format!("entries[{index}].when has an unmatched ')'"),
+                        path: Some(path.clone()),
+                    });
+                    unmatched_close = true;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !unmatched_close && depth > 0 {
+        problems.push(SemanticProblem {
+            code: "invalid_when_syntax",
+            message: format!("entries[{index}].when has an unmatched '('"),
+            path: Some(path.clone()),
+        });
+    }
+}
+
+/// Returns true if `when` contains an identifier immediately followed by `(`.
+fn when_has_func_call(when: &str) -> bool {
+    let mut chars = when.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_lowercase() {
+            while matches!(chars.peek(), Some(&x) if x.is_ascii_alphanumeric() || x == '_') {
+                chars.next();
+            }
+            while matches!(chars.peek(), Some(&' ')) {
+                chars.next();
+            }
+            if matches!(chars.peek(), Some(&'(')) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn has_dups(xs: &[String]) -> bool {
@@ -273,6 +408,24 @@ mod tests {
     }
 
     #[test]
+    fn canonicalize_non_ascii_utf8_passthrough() {
+        // Non-ASCII must NOT be escaped as \uXXXX — must stay UTF-8 to match JS/Python.
+        let v = json!({"quote": "ação"});
+        assert_eq!(canonicalize(&v), r#"{"quote":"ação"}"#);
+    }
+
+    #[test]
+    fn canonicalize_positive_exponent_normalised() {
+        // serde_json/ryu emits 1e21 but Python/JS emit 1e+21.
+        let v = json!({"n": 1e21_f64});
+        let s = canonicalize(&v);
+        assert!(
+            s.contains("e+"),
+            "expected e+ in canonical output, got: {s}"
+        );
+    }
+
+    #[test]
     fn hash_is_stable() {
         let v = fixture();
         let h1 = hash_spec(&v);
@@ -315,6 +468,36 @@ mod tests {
         let err = semantic_check(&v).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("does_not_exist"), "got: {msg}");
+    }
+
+    #[test]
+    fn semantic_rejects_dangling_and_operator() {
+        let mut v = fixture();
+        v["entries"][0]["when"] = json!("wy_spring &&");
+        assert!(semantic_check(&v).is_err());
+    }
+
+    #[test]
+    fn semantic_rejects_function_call_in_when() {
+        let mut v = fixture();
+        v["entries"][0]["when"] = json!("wy_spring()");
+        assert!(semantic_check(&v).is_err());
+    }
+
+    #[test]
+    fn semantic_rejects_arithmetic_in_when() {
+        let mut v = fixture();
+        v["entries"][0]["when"] = json!("wy_spring + vsa_no_supply");
+        assert!(semantic_check(&v).is_err());
+    }
+
+    #[test]
+    fn semantic_rejects_min_rr_below_three() {
+        let mut v = fixture();
+        v["risk"]["min_rr"] = json!("1.5");
+        let err = semantic_check(&v).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("min_rr"), "got: {msg}");
     }
 
     #[test]

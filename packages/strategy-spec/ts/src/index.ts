@@ -70,6 +70,7 @@ export function validate(input: unknown): ValidationResult {
 /**
  * Canonical JSON: recursively sort object keys, no whitespace, preserve array order.
  * Must match the Python and Rust implementations byte-for-byte.
+ * Non-ASCII is preserved as UTF-8 (JSON.stringify passthrough, matching Python ensure_ascii=False).
  */
 export function canonicalize(value: unknown): string {
   const sorter = (v: unknown): unknown => {
@@ -93,6 +94,51 @@ export function withHash(spec: StrategySpec): StrategySpec {
   return { ...spec, spec_hash: hash(spec) };
 }
 
+const ARITHMETIC_RE = /[+\-*/%]/;
+const FUNC_CALL_RE = /[a-z][a-z0-9_]*\s*\(/;
+
+function whenSyntaxProblems(when: string, index: number): string[] {
+  const problems: string[] = [];
+  const stripped = when.trim();
+
+  if (ARITHMETIC_RE.test(when)) {
+    problems.push(
+      `entries[${index}].when contains arithmetic operators (only && || ! ( ) and ids are allowed)`,
+    );
+  }
+  if (FUNC_CALL_RE.test(when)) {
+    problems.push(
+      `entries[${index}].when contains a function call; only bareword ids are allowed`,
+    );
+  }
+  if (stripped.endsWith("&&") || stripped.endsWith("||")) {
+    problems.push(`entries[${index}].when has a trailing binary operator`);
+  }
+  if (stripped.startsWith("&&") || stripped.startsWith("||")) {
+    problems.push(`entries[${index}].when has a leading binary operator`);
+  }
+
+  let depth = 0;
+  let unmatchedClose = false;
+  for (const c of when) {
+    if (c === "(") {
+      depth++;
+    } else if (c === ")") {
+      depth--;
+      if (depth < 0) {
+        problems.push(`entries[${index}].when has an unmatched ")"`);
+        unmatchedClose = true;
+        break;
+      }
+    }
+  }
+  if (!unmatchedClose && depth > 0) {
+    problems.push(`entries[${index}].when has an unmatched "("`);
+  }
+
+  return problems;
+}
+
 /**
  * Beyond JSON-Schema: enforce semantic invariants the schema cannot express.
  * Returns the list of human-readable problems (empty = ok).
@@ -108,6 +154,7 @@ export function semanticCheck(spec: StrategySpec): string[] {
 
   const idRe = /[a-z][a-z0-9_]{0,31}/g;
   for (const [i, e] of spec.entries.entries()) {
+    problems.push(...whenSyntaxProblems(e.when, i));
     const refs = e.when.match(idRe) ?? [];
     for (const r of refs) {
       if (r === "true" || r === "false") continue;
@@ -115,8 +162,8 @@ export function semanticCheck(spec: StrategySpec): string[] {
     }
   }
 
-  if (spec.risk.min_rr && Number(spec.risk.min_rr) < 1) {
-    problems.push("risk.min_rr must be >= 1 (Apostila methodology requires >= 3)");
+  if (spec.risk.min_rr && Number(spec.risk.min_rr) < 3) {
+    problems.push("risk.min_rr must be >= 3 (Apostila methodology requires >= 3)");
   }
 
   return problems;

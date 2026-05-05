@@ -37,6 +37,20 @@ def test_canonical_is_key_order_invariant() -> None:
     assert canonicalize(a) == canonicalize(b)
 
 
+def test_canonicalize_non_ascii_utf8_passthrough() -> None:
+    # Non-ASCII must be preserved as UTF-8, not escaped as \uXXXX, to match JS/Rust.
+    result = canonicalize({"quote": "ação"})
+    assert result == '{"quote":"ação"}'
+    assert "\\u" not in result
+
+
+def test_canonicalize_exponent_leading_zero_stripped() -> None:
+    # Python json.dumps outputs 1e-07; JS/Rust output 1e-7. Normalise to strip the leading zero.
+    result = canonicalize({"n": 1e-7})
+    assert "e-07" not in result
+    assert "e-7" in result
+
+
 def test_hash_is_stable(spec: dict) -> None:
     h1 = hash_spec(spec)
     h2 = hash_spec(spec)
@@ -66,7 +80,37 @@ def test_semantic_check_rejects_unknown_id(spec: dict) -> None:
     assert any("does_not_exist" in p.message for p in problems)
 
 
+def test_semantic_check_rejects_dangling_operator(spec: dict) -> None:
+    spec["entries"][0]["when"] = "wy_spring &&"
+    problems = semantic_check(spec)
+    assert any(p.code == "invalid_when_syntax" for p in problems)
+
+
+def test_semantic_check_rejects_function_call(spec: dict) -> None:
+    spec["entries"][0]["when"] = "wy_spring()"
+    problems = semantic_check(spec)
+    assert any(p.code == "invalid_when_syntax" for p in problems)
+
+
+def test_semantic_check_rejects_arithmetic(spec: dict) -> None:
+    spec["entries"][0]["when"] = "wy_spring + vsa_no_supply"
+    problems = semantic_check(spec)
+    assert any(p.code == "invalid_when_syntax" for p in problems)
+
+
+def test_semantic_check_rejects_min_rr_below_three(spec: dict) -> None:
+    spec["risk"]["min_rr"] = "1.5"
+    problems = semantic_check(spec)
+    assert any(p.code == "min_rr_below_three" for p in problems)
+
+
 def test_validation_rejects_float_per_trade_pct(spec: dict) -> None:
     spec["risk"]["per_trade_pct"] = 0.5  # number instead of decimal-string
+    with pytest.raises(SchemaValidationError):
+        validate(spec)
+
+
+def test_validation_rejects_invalid_uuid_pdf_id(spec: dict) -> None:
+    spec["citations"][0]["pdf_id"] = "not-a-uuid"
     with pytest.raises(SchemaValidationError):
         validate(spec)
