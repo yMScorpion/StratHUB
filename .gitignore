@@ -58,3 +58,6 @@ data/
 packages/strategy-spec/ts/dist/
 packages/strategy-spec/py/build/
 packages/strategy-spec/py/dist/
+
+# User methodology PDFs (proprietary, used in Phase 2 ingest)
+Apostila Excelência Trading (4).pdf
