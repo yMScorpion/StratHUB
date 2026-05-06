@@ -1,5 +1,5 @@
-// Minimal hand-written type stubs for the tables used in Phase 2.
-// Replace with generated types (`supabase gen types typescript`) in Phase 3.
+// Minimal hand-written type stubs for the tables used by the current phases.
+// Replace with generated types (`supabase gen types typescript`) before production.
 
 export type Json = string | number | boolean | null | { [key: string]: Json } | Json[];
 
@@ -22,6 +22,7 @@ export interface Database {
         };
         Insert: Partial<Database["public"]["Tables"]["strategy_jobs"]["Row"]>;
         Update: Partial<Database["public"]["Tables"]["strategy_jobs"]["Row"]>;
+        Relationships: [];
       };
       strategies: {
         Row: {
@@ -38,6 +39,22 @@ export interface Database {
         };
         Insert: Partial<Database["public"]["Tables"]["strategies"]["Row"]>;
         Update: Partial<Database["public"]["Tables"]["strategies"]["Row"]>;
+        Relationships: [];
+      };
+      audit_log: {
+        Row: {
+          id: string;
+          user_id: string;
+          actor_id: string | null;
+          action: string;
+          entity_type: string;
+          entity_id: string;
+          metadata: Json;
+          created_at: string;
+        };
+        Insert: Partial<Database["public"]["Tables"]["audit_log"]["Row"]>;
+        Update: Partial<Database["public"]["Tables"]["audit_log"]["Row"]>;
+        Relationships: [];
       };
       pdf_uploads: {
         Row: {
@@ -57,10 +74,28 @@ export interface Database {
         };
         Insert: Partial<Database["public"]["Tables"]["pdf_uploads"]["Row"]>;
         Update: Partial<Database["public"]["Tables"]["pdf_uploads"]["Row"]>;
+        Relationships: [];
       };
     };
     Views: Record<string, never>;
-    Functions: Record<string, never>;
+    Functions: {
+      review_strategy: {
+        Args: {
+          p_strategy_id: string;
+          p_action: "approve" | "reject" | "request_changes";
+          p_notes: string | null;
+        };
+        Returns: Array<{
+          id: string;
+          status: "needs_review" | "approved" | "rejected";
+          reviewed_at: string | null;
+        }>;
+      };
+      assert_strategy_approved: {
+        Args: { p_strategy_id: string };
+        Returns: undefined;
+      };
+    };
     Enums: Record<string, never>;
   };
 }
