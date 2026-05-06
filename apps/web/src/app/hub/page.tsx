@@ -87,9 +87,12 @@ export default async function HubPage() {
                 <td style={{ padding: "0.6rem 0.75rem", fontSize: "0.85rem", opacity: 0.7 }}>
                   {new Date(s.created_at).toLocaleDateString()}
                 </td>
-                <td style={{ padding: "0.6rem 0.75rem" }}>
+                <td style={{ padding: "0.6rem 0.75rem", display: "flex", gap: "0.75rem" }}>
                   <Link href={`/strategies/${s.id}/review`} style={{ color: "#2563eb", fontSize: "0.85rem" }}>
                     Review →
+                  </Link>
+                  <Link href={`/strategies/${s.id}/backtest`} style={{ color: "#2563eb", fontSize: "0.85rem" }}>
+                    Backtest →
                   </Link>
                 </td>
               </tr>

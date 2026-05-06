@@ -25,7 +25,6 @@ async function sha256hex(buf: ArrayBuffer): Promise<string> {
 export default function NewStrategyPage() {
   const router = useRouter();
   const [files, setFiles] = useState<FileEntry[]>([]);
-  const [jobId, setJobId] = useState<string | null>(null);
   const [phase, setPhase] = useState<"select" | "uploading" | "submitting" | "done">("select");
   const [globalError, setGlobalError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -74,7 +73,6 @@ export default function NewStrategyPage() {
       return;
     }
     const { job_id } = await jobRes.json() as { job_id: string };
-    setJobId(job_id);
 
     // 2. Hash + register + upload each file
     for (let i = 0; i < files.length; i++) {
@@ -131,8 +129,6 @@ export default function NewStrategyPage() {
     setPhase("done");
     setTimeout(() => router.push("/hub"), 1500);
   }
-
-  const allDone = files.length > 0 && files.every((f) => f.status === "done");
 
   return (
     <main style={{ padding: "2rem 4rem", maxWidth: 700 }}>
