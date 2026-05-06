@@ -30,6 +30,12 @@ CREATE POLICY "audit_log insertable by owner actor"
   ON audit_log FOR INSERT TO authenticated
   WITH CHECK (user_id = auth.uid() AND actor_id = auth.uid());
 
+DROP POLICY IF EXISTS "strategies updatable by owner" ON strategies;
+CREATE POLICY "strategies updatable by owner"
+  ON strategies FOR UPDATE TO authenticated
+  USING (user_id = auth.uid() AND status = 'needs_review')
+  WITH CHECK (user_id = auth.uid() AND status = 'needs_review');
+
 CREATE OR REPLACE FUNCTION enforce_strategy_review_transition()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -37,6 +43,11 @@ AS $$
 BEGIN
   IF new.status = old.status THEN
     RETURN new;
+  END IF;
+
+  IF current_setting('app.review_strategy_rpc', true) IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'strategy status can only be changed through review_strategy'
+      USING ERRCODE = '42501';
   END IF;
 
   IF old.status <> 'needs_review' THEN
@@ -60,6 +71,30 @@ CREATE TRIGGER strategies_enforce_review_transition
   BEFORE UPDATE OF status ON strategies
   FOR EACH ROW EXECUTE FUNCTION enforce_strategy_review_transition();
 
+CREATE OR REPLACE FUNCTION enforce_strategy_spec_immutability()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF new.status IN ('approved', 'rejected')
+    AND (
+      new.spec_jsonb IS DISTINCT FROM old.spec_jsonb
+      OR new.spec_hash IS DISTINCT FROM old.spec_hash
+    )
+  THEN
+    RAISE EXCEPTION 'approved or rejected strategy specs are immutable'
+      USING ERRCODE = '23514';
+  END IF;
+
+  RETURN new;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS strategies_enforce_spec_immutability ON strategies;
+CREATE TRIGGER strategies_enforce_spec_immutability
+  BEFORE UPDATE OF spec_jsonb, spec_hash ON strategies
+  FOR EACH ROW EXECUTE FUNCTION enforce_strategy_spec_immutability();
+
 CREATE OR REPLACE FUNCTION review_strategy(
   p_strategy_id uuid,
   p_action text,
@@ -67,7 +102,8 @@ CREATE OR REPLACE FUNCTION review_strategy(
 )
 RETURNS TABLE (id uuid, status text, reviewed_at timestamptz)
 LANGUAGE plpgsql
-SECURITY INVOKER
+SECURITY DEFINER
+SET search_path = public, pg_temp
 AS $$
 DECLARE
   v_strategy strategies%ROWTYPE;
@@ -99,12 +135,14 @@ BEGIN
     END IF;
     v_audit_action := 'strategy.review.request_changes';
   ELSIF p_action = 'approve' THEN
+    PERFORM set_config('app.review_strategy_rpc', 'on', true);
     UPDATE strategies
     SET status = 'approved'
     WHERE strategies.id = p_strategy_id
     RETURNING * INTO v_strategy;
     v_audit_action := 'strategy.review.approved';
   ELSE
+    PERFORM set_config('app.review_strategy_rpc', 'on', true);
     UPDATE strategies
     SET status = 'rejected'
     WHERE strategies.id = p_strategy_id
