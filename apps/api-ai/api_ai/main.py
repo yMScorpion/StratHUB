@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel
 
 from strategy_spec import (
@@ -18,6 +18,15 @@ from strategy_spec import (
 
 from .routes.jobs import router as jobs_router
 from .settings import Settings, load_settings
+
+
+def _require_internal(
+    request: Request,
+    x_internal_token: str = Header(..., alias="X-Internal-Token"),
+) -> None:
+    """Verify the caller is the trusted Next.js server (shared secret)."""
+    if x_internal_token != request.app.state.settings.internal_api_key:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def create_app() -> FastAPI:
@@ -43,7 +52,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
-    app.include_router(jobs_router)
+    app.include_router(jobs_router, dependencies=[Depends(_require_internal)])
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:

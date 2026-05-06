@@ -63,6 +63,13 @@ def test_canonicalize_1e_minus_6_uses_decimal() -> None:
     assert result == '{"n":0.000001}'
 
 
+def test_canonicalize_1e21_uses_scientific() -> None:
+    # 1e21 has ECMAScript n=22 > 21: JS emits "1e+21", not the integer "1000000000000000000000".
+    # _normalize must not convert it to int before _js_number handles it.
+    result = canonicalize({"n": 1e21})
+    assert result == '{"n":1e+21}'
+
+
 def test_hash_is_stable(spec: dict) -> None:
     h1 = hash_spec(spec)
     h2 = hash_spec(spec)

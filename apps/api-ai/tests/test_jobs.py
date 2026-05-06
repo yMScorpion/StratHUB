@@ -24,7 +24,10 @@ def _client(sb_mock: MagicMock | None = None, arq_mock: MagicMock | None = None)
     return TestClient(_make_app(sb_mock, arq_mock))
 
 
-HEADERS = {"X-User-Id": "00000000-0000-0000-0000-000000000001"}
+HEADERS = {
+    "X-User-Id": "00000000-0000-0000-0000-000000000001",
+    "X-Internal-Token": "replace-me",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -214,3 +217,57 @@ def test_submit_job_no_pdfs():
     )
     r = TestClient(_make_app(sb)).post("/jobs/job-1/submit", headers=HEADERS)
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# DELETE /jobs/{id}/pdfs/{upload_id}
+# ---------------------------------------------------------------------------
+
+
+def _sb_for_delete(ref_count: int = 0) -> MagicMock:
+    sb = MagicMock()
+    # job lookup
+    sb.table.return_value.select.return_value.eq.return_value.eq.return_value.single.return_value.execute.return_value = MagicMock(
+        data={"id": "job-1", "status": "queued", "pdf_count": 1}
+    )
+    # upload lookup
+    sb.table.return_value.select.return_value.eq.return_value.eq.return_value.eq.return_value.single.return_value.execute.return_value = MagicMock(
+        data={"id": "upload-1", "storage_path": "user/job-1/upload-1.pdf"}
+    )
+    # ref-count check: how many OTHER rows share this storage_path
+    sb.table.return_value.select.return_value.eq.return_value.neq.return_value.execute.return_value = MagicMock(
+        count=ref_count
+    )
+    sb.table.return_value.delete.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+    sb.table.return_value.update.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
+    return sb
+
+
+def test_delete_upload_removes_storage_when_no_other_refs():
+    sb = _sb_for_delete(ref_count=0)
+    r = TestClient(_make_app(sb)).delete("/jobs/job-1/pdfs/upload-1", headers=HEADERS)
+    assert r.status_code == 200
+    sb.storage.from_.return_value.remove.assert_called_once()
+
+
+def test_delete_upload_skips_storage_when_shared():
+    sb = _sb_for_delete(ref_count=1)
+    r = TestClient(_make_app(sb)).delete("/jobs/job-1/pdfs/upload-1", headers=HEADERS)
+    assert r.status_code == 200
+    sb.storage.from_.return_value.remove.assert_not_called()
+
+
+def test_jobs_routes_reject_missing_internal_token():
+    r = TestClient(_make_app()).post(
+        "/jobs", json={"idempotency_key": "k"}, headers={"X-User-Id": "00000000-0000-0000-0000-000000000001"}
+    )
+    assert r.status_code == 422  # missing required header
+
+
+def test_jobs_routes_reject_wrong_internal_token():
+    r = TestClient(_make_app()).post(
+        "/jobs",
+        json={"idempotency_key": "k"},
+        headers={"X-User-Id": "00000000-0000-0000-0000-000000000001", "X-Internal-Token": "wrong"},
+    )
+    assert r.status_code == 401

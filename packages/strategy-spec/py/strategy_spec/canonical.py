@@ -39,7 +39,10 @@ def _normalize(value: Any) -> Any:
     if isinstance(value, bool):
         return value
     if isinstance(value, float):
-        if math.isfinite(value) and value.is_integer():
+        # JS JSON.stringify uses scientific notation for abs >= 1e21 (n > 21 in ECMAScript).
+        # Converting those to Python int would produce decimal form (wrong). Only convert
+        # integer-valued floats that JS would also format as a decimal integer.
+        if math.isfinite(value) and value.is_integer() and abs(value) < 1e21:
             return int(value)
         return value
     if isinstance(value, dict):

@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     # Concurrent validator cap (enforced in Phase 5)
     max_concurrent_validators: int = Field(default=5, ge=0, le=50)
 
+    # Shared secret the Next.js server must send in X-Internal-Token.
+    # Must be overridden in production via INTERNAL_API_KEY env var.
+    internal_api_key: str = "replace-me"
+
 
 def load_settings() -> Settings:
     return Settings()

@@ -101,11 +101,13 @@ function tokenizeWhen(stripped: string): string[] | { bad: string } {
   const tokens: string[] = [];
   let pos = 0;
   while (pos < stripped.length) {
-    if (/\s/.test(stripped[pos])) { pos++; continue; }
+    if (/\s/.test(stripped.charAt(pos))) { pos++; continue; }
     const m = stripped.slice(pos).match(WHEN_TOKEN_RE);
     if (m) {
-      tokens.push(m[1]);
-      pos += m[1].length;
+      // m[1] is always defined: WHEN_TOKEN_RE has one required capture group
+      const tok = m[1] as string;
+      tokens.push(tok);
+      pos += tok.length;
     } else {
       return { bad: stripped.slice(pos, pos + 4) };
     }
@@ -139,7 +141,8 @@ function whenSyntaxProblems(when: string, index: number): string[] {
   let pos = 0;
 
   const peek = (): string | undefined => tokens[pos];
-  const consume = (): string => tokens[pos++];
+  // consume() is only called after peek() confirms a token exists
+  const consume = (): string => tokens[pos++] as string;
 
   const parseOr = (): void => { parseAnd(); while (peek() === "||") { consume(); parseAnd(); } };
   const parseAnd = (): void => { parseNot(); while (peek() === "&&") { consume(); parseNot(); } };

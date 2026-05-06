@@ -330,10 +330,20 @@ async def delete_upload(
         raise HTTPException(status_code=404, detail="Upload not found")
 
     storage_path = upload_resp.data["storage_path"]
-    try:
-        sb.storage.from_("pdfs").remove([storage_path])
-    except Exception as exc:
-        _LOG.warning("Storage remove failed for %s: %s", storage_path, exc)
+    # Only remove the storage object when no other pdf_uploads row shares this path.
+    # SHA-256 dedup in register_pdf can create multiple rows pointing at the same object.
+    ref_resp = (
+        sb.table("pdf_uploads")
+        .select("id", count="exact")
+        .eq("storage_path", storage_path)
+        .neq("id", upload_id)
+        .execute()
+    )
+    if (ref_resp.count or 0) == 0:
+        try:
+            sb.storage.from_("pdfs").remove([storage_path])
+        except Exception as exc:
+            _LOG.warning("Storage remove failed for %s: %s", storage_path, exc)
 
     sb.table("pdf_uploads").delete().eq("id", upload_id).execute()
     new_count = max(0, job_resp.data["pdf_count"] - 1)
