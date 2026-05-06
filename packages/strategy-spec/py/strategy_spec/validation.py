@@ -69,70 +69,97 @@ def validate(spec: dict[str, Any]) -> dict[str, Any]:
 
 
 _ID_RE = re.compile(r"[a-z][a-z0-9_]{0,31}")
-_ARITHMETIC_RE = re.compile(r"[+\-*/%]")
-_FUNC_CALL_RE = re.compile(r"[a-z][a-z0-9_]*\s*\(")
+# Tokeniser: longest-match ordered so && and || are consumed before their individual chars.
+_WHEN_TOKEN_RE = re.compile(r"&&|\|\||!|\(|\)|[a-z][a-z0-9_]{0,31}")
+
+
+class _ParseError(Exception):
+    pass
 
 
 def _when_syntax_problems(when: str, index: int) -> list[SemanticProblem]:
-    """Check `when` expression syntax without resolving ids.
+    """Parse `when` as a boolean expression; return problems on invalid syntax.
 
-    Allowed tokens: bareword ids, true/false, && || ! ( ).
-    Rejects: arithmetic operators, function calls, dangling binary ops, unbalanced parens.
+    Grammar:
+        expr    ::= or
+        or      ::= and ('||' and)*
+        and     ::= not ('&&' not)*
+        not     ::= '!' not | primary
+        primary ::= ID | '(' expr ')'
     """
     path = f"entries[{index}].when"
-    problems: list[SemanticProblem] = []
     stripped = when.strip()
 
-    if _ARITHMETIC_RE.search(when):
-        problems.append(SemanticProblem(
-            "invalid_when_syntax",
-            f"entries[{index}].when contains arithmetic operators "
-            "(only && || ! ( ) and ids are allowed)",
-            path,
-        ))
+    # Tokenise — any character not consumed by the token regex is illegal.
+    tokens: list[str] = []
+    pos = 0
+    while pos < len(stripped):
+        if stripped[pos].isspace():
+            pos += 1
+            continue
+        m = _WHEN_TOKEN_RE.match(stripped, pos)
+        if m:
+            tokens.append(m.group())
+            pos = m.end()
+        else:
+            bad = stripped[pos:pos + 4]
+            return [SemanticProblem("invalid_when_syntax", f"entries[{index}].when: unexpected token {bad!r}", path)]
 
-    if _FUNC_CALL_RE.search(when):
-        problems.append(SemanticProblem(
-            "invalid_when_syntax",
-            f"entries[{index}].when contains a function call; only bareword ids are allowed",
-            path,
-        ))
+    if not tokens:
+        return [SemanticProblem("invalid_when_syntax", f"entries[{index}].when cannot be empty", path)]
 
-    if stripped.endswith("&&") or stripped.endswith("||"):
-        problems.append(SemanticProblem(
-            "invalid_when_syntax",
-            f"entries[{index}].when has a trailing binary operator",
-            path,
-        ))
+    cursor = [0]
 
-    if stripped.startswith("&&") or stripped.startswith("||"):
-        problems.append(SemanticProblem(
-            "invalid_when_syntax",
-            f"entries[{index}].when has a leading binary operator",
-            path,
-        ))
+    def peek() -> str | None:
+        return tokens[cursor[0]] if cursor[0] < len(tokens) else None
 
-    depth = 0
-    for c in when:
-        if c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-            if depth < 0:
-                problems.append(SemanticProblem(
-                    "invalid_when_syntax",
-                    f'entries[{index}].when has an unmatched ")"',
-                    path,
-                ))
-                depth = 0
-    if depth != 0:
-        problems.append(SemanticProblem(
-            "invalid_when_syntax",
-            f'entries[{index}].when has an unmatched "("',
-            path,
-        ))
+    def consume() -> str:
+        tok = tokens[cursor[0]]
+        cursor[0] += 1
+        return tok
 
-    return problems
+    def parse_or() -> None:
+        parse_and()
+        while peek() == "||":
+            consume()
+            parse_and()
+
+    def parse_and() -> None:
+        parse_not()
+        while peek() == "&&":
+            consume()
+            parse_not()
+
+    def parse_not() -> None:
+        if peek() == "!":
+            consume()
+            parse_not()
+        else:
+            parse_primary()
+
+    def parse_primary() -> None:
+        t = peek()
+        if t is None:
+            raise _ParseError("unexpected end of expression")
+        if t == "(":
+            consume()
+            parse_or()
+            if peek() != ")":
+                raise _ParseError("expected ')'")
+            consume()
+        elif _ID_RE.fullmatch(t):
+            consume()
+        else:
+            raise _ParseError(f"unexpected token {t!r}")
+
+    try:
+        parse_or()
+        if cursor[0] < len(tokens):
+            raise _ParseError(f"unexpected token {tokens[cursor[0]]!r}")
+    except _ParseError as exc:
+        return [SemanticProblem("invalid_when_syntax", f"entries[{index}].when: {exc}", path)]
+
+    return []
 
 
 def semantic_check(spec: dict[str, Any]) -> list[SemanticProblem]:

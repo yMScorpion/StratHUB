@@ -262,98 +262,124 @@ pub fn semantic_check(spec: &Value) -> Result<(), SpecError> {
     }
 }
 
-/// Validate the boolean `when` expression syntax (does not check id existence).
-/// Allowed: bareword ids, `true`, `false`, `&&`, `||`, `!`, `(`, `)`.
-/// Rejected: arithmetic operators, function calls, dangling binary operators, unbalanced parens.
+/// Validate the boolean `when` expression syntax using a recursive descent parser.
+///
+/// Grammar:
+///   expr    ::= or
+///   or      ::= and ('||' and)*
+///   and     ::= not ('&&' not)*
+///   not     ::= '!' not | primary
+///   primary ::= ID | '(' expr ')'
 fn check_when_syntax(when: &str, index: usize, problems: &mut Vec<SemanticProblem>) {
     let path = format!("entries[{index}].when");
-    let stripped = when.trim();
-
-    if when
-        .chars()
-        .any(|c| matches!(c, '+' | '-' | '*' | '/' | '%'))
-    {
-        problems.push(SemanticProblem {
+    match parse_when(when.trim()) {
+        Ok(()) => {}
+        Err(msg) => problems.push(SemanticProblem {
             code: "invalid_when_syntax",
-            message: format!(
-                "entries[{index}].when contains arithmetic operators (only && || ! ( ) and ids are allowed)"
-            ),
-            path: Some(path.clone()),
-        });
-    }
-
-    if when_has_func_call(when) {
-        problems.push(SemanticProblem {
-            code: "invalid_when_syntax",
-            message: format!(
-                "entries[{index}].when contains a function call; only bareword ids are allowed"
-            ),
-            path: Some(path.clone()),
-        });
-    }
-
-    if stripped.ends_with("&&") || stripped.ends_with("||") {
-        problems.push(SemanticProblem {
-            code: "invalid_when_syntax",
-            message: format!("entries[{index}].when has a trailing binary operator"),
-            path: Some(path.clone()),
-        });
-    }
-
-    if stripped.starts_with("&&") || stripped.starts_with("||") {
-        problems.push(SemanticProblem {
-            code: "invalid_when_syntax",
-            message: format!("entries[{index}].when has a leading binary operator"),
-            path: Some(path.clone()),
-        });
-    }
-
-    let mut depth: i32 = 0;
-    let mut unmatched_close = false;
-    for c in when.chars() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth < 0 {
-                    problems.push(SemanticProblem {
-                        code: "invalid_when_syntax",
-                        message: format!("entries[{index}].when has an unmatched ')'"),
-                        path: Some(path.clone()),
-                    });
-                    unmatched_close = true;
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    if !unmatched_close && depth > 0 {
-        problems.push(SemanticProblem {
-            code: "invalid_when_syntax",
-            message: format!("entries[{index}].when has an unmatched '('"),
-            path: Some(path.clone()),
-        });
+            message: format!("entries[{index}].when: {msg}"),
+            path: Some(path),
+        }),
     }
 }
 
-/// Returns true if `when` contains an identifier immediately followed by `(`.
-fn when_has_func_call(when: &str) -> bool {
-    let mut chars = when.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c.is_ascii_lowercase() {
-            while matches!(chars.peek(), Some(&x) if x.is_ascii_alphanumeric() || x == '_') {
-                chars.next();
+fn parse_when(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Err("expression cannot be empty".into());
+    }
+    let tokens = tokenize_when(s)?;
+    let mut pos = 0usize;
+    parse_or(&tokens, &mut pos)?;
+    if pos < tokens.len() {
+        return Err(format!("unexpected token {:?}", tokens[pos]));
+    }
+    Ok(())
+}
+
+fn tokenize_when(s: &str) -> Result<Vec<String>, String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut i = 0;
+    while i < n {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if n - i >= 2 && &b[i..i + 2] == b"&&" {
+            tokens.push("&&".into());
+            i += 2;
+        } else if n - i >= 2 && &b[i..i + 2] == b"||" {
+            tokens.push("||".into());
+            i += 2;
+        } else if b[i] == b'!' {
+            tokens.push("!".into());
+            i += 1;
+        } else if b[i] == b'(' {
+            tokens.push("(".into());
+            i += 1;
+        } else if b[i] == b')' {
+            tokens.push(")".into());
+            i += 1;
+        } else if b[i].is_ascii_lowercase() {
+            let start = i;
+            i += 1;
+            while i < n && (b[i].is_ascii_lowercase() || b[i].is_ascii_digit() || b[i] == b'_') {
+                i += 1;
             }
-            while matches!(chars.peek(), Some(&' ')) {
-                chars.next();
-            }
-            if matches!(chars.peek(), Some(&'(')) {
-                return true;
-            }
+            tokens.push(s[start..i].to_string());
+        } else {
+            let end = std::cmp::min(i + 4, n);
+            return Err(format!("unexpected token {:?}", &s[i..end]));
         }
     }
-    false
+    Ok(tokens)
+}
+
+fn parse_or(tokens: &[String], pos: &mut usize) -> Result<(), String> {
+    parse_and(tokens, pos)?;
+    while tokens.get(*pos).map(String::as_str) == Some("||") {
+        *pos += 1;
+        parse_and(tokens, pos)?;
+    }
+    Ok(())
+}
+
+fn parse_and(tokens: &[String], pos: &mut usize) -> Result<(), String> {
+    parse_not(tokens, pos)?;
+    while tokens.get(*pos).map(String::as_str) == Some("&&") {
+        *pos += 1;
+        parse_not(tokens, pos)?;
+    }
+    Ok(())
+}
+
+fn parse_not(tokens: &[String], pos: &mut usize) -> Result<(), String> {
+    if tokens.get(*pos).map(String::as_str) == Some("!") {
+        *pos += 1;
+        parse_not(tokens, pos)
+    } else {
+        parse_primary(tokens, pos)
+    }
+}
+
+fn parse_primary(tokens: &[String], pos: &mut usize) -> Result<(), String> {
+    match tokens.get(*pos) {
+        None => Err("unexpected end of expression".into()),
+        Some(t) if t == "(" => {
+            *pos += 1;
+            parse_or(tokens, pos)?;
+            if tokens.get(*pos).map(String::as_str) != Some(")") {
+                return Err("expected ')'".into());
+            }
+            *pos += 1;
+            Ok(())
+        }
+        Some(t) if t.starts_with(|c: char| c.is_ascii_lowercase()) => {
+            *pos += 1;
+            Ok(())
+        }
+        Some(t) => Err(format!("unexpected token {:?}", t)),
+    }
 }
 
 fn has_dups(xs: &[String]) -> bool {

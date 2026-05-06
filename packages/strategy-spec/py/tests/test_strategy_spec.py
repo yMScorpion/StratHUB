@@ -45,10 +45,22 @@ def test_canonicalize_non_ascii_utf8_passthrough() -> None:
 
 
 def test_canonicalize_exponent_leading_zero_stripped() -> None:
-    # Python json.dumps outputs 1e-07; JS/Rust output 1e-7. Normalise to strip the leading zero.
+    # 1e-7 is below the JS decimal threshold; both sides use scientific notation.
     result = canonicalize({"n": 1e-7})
     assert "e-07" not in result
     assert "e-7" in result
+
+
+def test_canonicalize_string_not_mutated_by_exponent_fix() -> None:
+    # Exponent normalisation must never touch e-notation inside string values.
+    result = canonicalize({"quote": "e-07 marker"})
+    assert result == '{"quote":"e-07 marker"}'
+
+
+def test_canonicalize_1e_minus_6_uses_decimal() -> None:
+    # 1e-6 is within JS's decimal range; Python must emit 0.000001 to match JS/Rust.
+    result = canonicalize({"n": 1e-6})
+    assert result == '{"n":0.000001}'
 
 
 def test_hash_is_stable(spec: dict) -> None:
@@ -94,6 +106,24 @@ def test_semantic_check_rejects_function_call(spec: dict) -> None:
 
 def test_semantic_check_rejects_arithmetic(spec: dict) -> None:
     spec["entries"][0]["when"] = "wy_spring + vsa_no_supply"
+    problems = semantic_check(spec)
+    assert any(p.code == "invalid_when_syntax" for p in problems)
+
+
+def test_semantic_check_rejects_adjacent_identifiers(spec: dict) -> None:
+    spec["entries"][0]["when"] = "wy_spring vsa_no_supply"
+    problems = semantic_check(spec)
+    assert any(p.code == "invalid_when_syntax" for p in problems)
+
+
+def test_semantic_check_rejects_consecutive_operators(spec: dict) -> None:
+    spec["entries"][0]["when"] = "wy_spring && || vsa_no_supply"
+    problems = semantic_check(spec)
+    assert any(p.code == "invalid_when_syntax" for p in problems)
+
+
+def test_semantic_check_rejects_infix_negation(spec: dict) -> None:
+    spec["entries"][0]["when"] = "wy_spring ! vsa_no_supply"
     problems = semantic_check(spec)
     assert any(p.code == "invalid_when_syntax" for p in problems)
 
