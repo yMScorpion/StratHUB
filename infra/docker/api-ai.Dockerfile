@@ -5,6 +5,15 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     UV_LINK_MODE=copy
 
+# Phase 2: Tesseract OCR + language packs (por+eng) for scanned-PDF fallback.
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+      tesseract-ocr \
+      tesseract-ocr-por \
+      tesseract-ocr-eng \
+      libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir uv==0.5.13
 
 WORKDIR /app
@@ -26,5 +35,4 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 EXPOSE 8000
 
-# Distroless-style: smaller surface area than the default python image's tools.
 CMD ["uvicorn", "api_ai.main:app", "--host", "0.0.0.0", "--port", "8000"]

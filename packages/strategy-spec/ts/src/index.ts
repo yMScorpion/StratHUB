@@ -94,49 +94,82 @@ export function withHash(spec: StrategySpec): StrategySpec {
   return { ...spec, spec_hash: hash(spec) };
 }
 
-const ARITHMETIC_RE = /[+\-*/%]/;
-const FUNC_CALL_RE = /[a-z][a-z0-9_]*\s*\(/;
+// Tokeniser: longest-match ordered so && / || are consumed before their individual chars.
+const WHEN_TOKEN_RE = /^(&&|\|\||!|\(|\)|[a-z][a-z0-9_]{0,31})/;
 
-function whenSyntaxProblems(when: string, index: number): string[] {
-  const problems: string[] = [];
-  const stripped = when.trim();
-
-  if (ARITHMETIC_RE.test(when)) {
-    problems.push(
-      `entries[${index}].when contains arithmetic operators (only && || ! ( ) and ids are allowed)`,
-    );
-  }
-  if (FUNC_CALL_RE.test(when)) {
-    problems.push(
-      `entries[${index}].when contains a function call; only bareword ids are allowed`,
-    );
-  }
-  if (stripped.endsWith("&&") || stripped.endsWith("||")) {
-    problems.push(`entries[${index}].when has a trailing binary operator`);
-  }
-  if (stripped.startsWith("&&") || stripped.startsWith("||")) {
-    problems.push(`entries[${index}].when has a leading binary operator`);
-  }
-
-  let depth = 0;
-  let unmatchedClose = false;
-  for (const c of when) {
-    if (c === "(") {
-      depth++;
-    } else if (c === ")") {
-      depth--;
-      if (depth < 0) {
-        problems.push(`entries[${index}].when has an unmatched ")"`);
-        unmatchedClose = true;
-        break;
-      }
+function tokenizeWhen(stripped: string): string[] | { bad: string } {
+  const tokens: string[] = [];
+  let pos = 0;
+  while (pos < stripped.length) {
+    if (/\s/.test(stripped.charAt(pos))) { pos++; continue; }
+    const m = stripped.slice(pos).match(WHEN_TOKEN_RE);
+    if (m) {
+      // m[1] is always defined: WHEN_TOKEN_RE has one required capture group
+      const tok = m[1] as string;
+      tokens.push(tok);
+      pos += tok.length;
+    } else {
+      return { bad: stripped.slice(pos, pos + 4) };
     }
   }
-  if (!unmatchedClose && depth > 0) {
-    problems.push(`entries[${index}].when has an unmatched "("`);
+  return tokens;
+}
+
+/**
+ * Parse `when` as a boolean expression; return a problem string on invalid syntax.
+ *
+ * Grammar:
+ *   expr    ::= or
+ *   or      ::= and ('||' and)*
+ *   and     ::= not ('&&' not)*
+ *   not     ::= '!' not | primary
+ *   primary ::= ID | '(' expr ')'
+ */
+function whenSyntaxProblems(when: string, index: number): string[] {
+  const prefix = `entries[${index}].when`;
+  const stripped = when.trim();
+
+  const toks = tokenizeWhen(stripped);
+  if (!Array.isArray(toks)) {
+    return [`${prefix}: unexpected token "${toks.bad}"`];
+  }
+  if (toks.length === 0) {
+    return [`${prefix}: expression cannot be empty`];
   }
 
-  return problems;
+  const tokens = toks;
+  let pos = 0;
+
+  const peek = (): string | undefined => tokens[pos];
+  // consume() is only called after peek() confirms a token exists
+  const consume = (): string => tokens[pos++] as string;
+
+  const parseOr = (): void => { parseAnd(); while (peek() === "||") { consume(); parseAnd(); } };
+  const parseAnd = (): void => { parseNot(); while (peek() === "&&") { consume(); parseNot(); } };
+  const parseNot = (): void => { if (peek() === "!") { consume(); parseNot(); } else parsePrimary(); };
+  const parsePrimary = (): void => {
+    const t = peek();
+    if (t === undefined) throw new Error("unexpected end of expression");
+    if (t === "(") {
+      consume();
+      parseOr();
+      if (peek() !== ")") throw new Error("expected ')'");
+      consume();
+    } else if (/^[a-z][a-z0-9_]{0,31}$/.test(t)) {
+      consume();
+    } else {
+      throw new Error(`unexpected token "${t}"`);
+    }
+  };
+
+  try {
+    parseOr();
+    if (pos < tokens.length) throw new Error(`unexpected token "${tokens[pos]}"`);
+  } catch (e) {
+    return [`${prefix}: ${(e as Error).message}`];
+  }
+
+  return [];
 }
 
 /**

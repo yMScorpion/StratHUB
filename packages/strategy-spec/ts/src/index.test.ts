@@ -61,21 +61,47 @@ test("semanticCheck rejects dangling && operator", () => {
   const broken = JSON.parse(JSON.stringify(fixture));
   broken.entries[0].when = "wy_spring &&";
   const problems = semanticCheck(broken);
-  assert.ok(problems.some((p) => p.includes("trailing binary operator")));
+  assert.ok(problems.some((p) => p.includes("entries[0].when")));
 });
 
 test("semanticCheck rejects function call in when", () => {
   const broken = JSON.parse(JSON.stringify(fixture));
   broken.entries[0].when = "wy_spring()";
   const problems = semanticCheck(broken);
-  assert.ok(problems.some((p) => p.includes("function call")));
+  assert.ok(problems.some((p) => p.includes("entries[0].when")));
 });
 
 test("semanticCheck rejects arithmetic operator in when", () => {
   const broken = JSON.parse(JSON.stringify(fixture));
   broken.entries[0].when = "wy_spring + vsa_no_supply";
   const problems = semanticCheck(broken);
-  assert.ok(problems.some((p) => p.includes("arithmetic")));
+  assert.ok(problems.some((p) => p.includes("entries[0].when")));
+});
+
+test("semanticCheck rejects two adjacent identifiers (missing operator)", () => {
+  const broken = JSON.parse(JSON.stringify(fixture));
+  broken.entries[0].when = "wy_spring vsa_no_supply";
+  const problems = semanticCheck(broken);
+  assert.ok(problems.some((p) => p.includes("entries[0].when")));
+});
+
+test("semanticCheck rejects consecutive operators (&& ||)", () => {
+  const broken = JSON.parse(JSON.stringify(fixture));
+  broken.entries[0].when = "wy_spring && || vsa_no_supply";
+  const problems = semanticCheck(broken);
+  assert.ok(problems.some((p) => p.includes("entries[0].when")));
+});
+
+test("semanticCheck rejects infix negation (id ! id)", () => {
+  const broken = JSON.parse(JSON.stringify(fixture));
+  broken.entries[0].when = "wy_spring ! vsa_no_supply";
+  const problems = semanticCheck(broken);
+  assert.ok(problems.some((p) => p.includes("entries[0].when")));
+});
+
+test("canonicalize does not mutate string content containing e-notation", () => {
+  const result = canonicalize({ quote: "e-07 marker" });
+  assert.equal(result, '{"quote":"e-07 marker"}');
 });
 
 test("semanticCheck rejects min_rr below 3", () => {
