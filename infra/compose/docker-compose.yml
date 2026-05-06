@@ -30,6 +30,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       SUPABASE_URL: http://host.docker.internal:54321
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-replace-me}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-replace-me}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-replace-me}
       OPENROUTER_MODEL_PRIMARY: deepseek/deepseek-v4-pro
     ports:
@@ -53,6 +54,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       SUPABASE_URL: http://host.docker.internal:54321
       SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:-replace-me}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:-replace-me}
     depends_on:
       redis:
         condition: service_healthy
@@ -66,6 +68,7 @@ services:
       NEXT_PUBLIC_SUPABASE_URL: http://localhost:54321
       NEXT_PUBLIC_SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-replace-me}
       API_AI_BASE_URL: http://api-ai:8000
+      API_AI_INTERNAL_TOKEN: ${INTERNAL_API_KEY:-replace-me}
     ports:
       - "3000:3000"
     depends_on:
@@ -74,5 +77,24 @@ services:
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/healthz"]
       interval: 5s
+      timeout: 3s
+      retries: 12
+
+  symphony:
+    build:
+      context: ../..
+      dockerfile: infra/docker/symphony.Dockerfile
+    container_name: cts-symphony
+    environment:
+      LINEAR_API_KEY: ${LINEAR_API_KEY:-replace-me}
+      GH_TOKEN: ${GH_TOKEN:-}
+    volumes:
+      - ../../.symphony:/data
+      - ../../:/repo
+    ports:
+      - "8765:8765"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/healthz').read()"]
+      interval: 10s
       timeout: 3s
       retries: 12

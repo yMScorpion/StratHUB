@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Symphony</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar" aria-label="Symphony navigation">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M5 13.5c3.4 0 3.4-7 6.8-7s3.4 11 6.8 11" />
+              <path d="M5 17.5c3.4 0 3.4-11 6.8-11s3.4 7 6.8 7" />
+            </svg>
+          </div>
+          <div>
+            <h1>Symphony</h1>
+            <p>Local agent control plane</p>
+          </div>
+        </div>
+
+        <nav class="nav-list" aria-label="Primary">
+          <a class="nav-item active" href="#tasks">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 7h10M8 12h10M8 17h7M4 7h.01M4 12h.01M4 17h.01" /></svg>
+            Tasks
+          </a>
+          <a class="nav-item" href="#agents">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" /></svg>
+            Agents
+          </a>
+          <a class="nav-item" href="#pipeline">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16M8 6v12M16 6v12" /></svg>
+            Pipeline
+          </a>
+        </nav>
+
+        <div class="sidebar-panel">
+          <span class="eyebrow">Scheduler</span>
+          <div class="pulse-row">
+            <span class="pulse" aria-hidden="true"></span>
+            <strong id="scheduler-status">Running</strong>
+          </div>
+          <p id="sync-copy">Polling local state every few seconds.</p>
+        </div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <span class="eyebrow">Autonomous delivery</span>
+            <h2>Delegate, review, publish, monitor</h2>
+          </div>
+          <div class="topbar-actions">
+            <button class="ghost-button" id="refresh" type="button">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" /></svg>
+              Refresh
+            </button>
+          </div>
+        </header>
+
+        <section class="metric-grid" aria-label="Task metrics">
+          <article class="metric">
+            <span>Active</span>
+            <strong id="metric-active">0</strong>
+          </article>
+          <article class="metric">
+            <span>Waiting review</span>
+            <strong id="metric-review">0</strong>
+          </article>
+          <article class="metric">
+            <span>Open PRs</span>
+            <strong id="metric-prs">0</strong>
+          </article>
+          <article class="metric">
+            <span>Agents</span>
+            <strong id="metric-agents">0</strong>
+          </article>
+        </section>
+
+        <section class="hero-panel" aria-label="Create task">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">New delegation</span>
+              <h3>Create task</h3>
+            </div>
+          </div>
+          <form id="task-form" class="task-composer">
+            <label>
+              <span>Title</span>
+              <input name="title" placeholder="Implement risk limit editor" required />
+            </label>
+            <label>
+              <span>Task details</span>
+              <textarea name="description" placeholder="Describe the expected change, tests, and constraints." required></textarea>
+            </label>
+            <div class="form-row">
+              <label>
+                <span>Repository</span>
+                <input name="repo_url" placeholder="Default repository" />
+              </label>
+              <label>
+                <span>Base branch</span>
+                <input name="base_branch" value="main" />
+              </label>
+              <label>
+                <span>Agent</span>
+                <select name="agent_id" id="agent-select">
+                  <option value="">Auto assign</option>
+                </select>
+              </label>
+            </div>
+            <button class="primary-button" type="submit">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 5l7 7-7 7" /></svg>
+              Create and delegate
+            </button>
+          </form>
+        </section>
+
+        <section class="content-grid">
+          <article class="panel" id="agents">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Capacity</span>
+                <h3>Agents</h3>
+              </div>
+            </div>
+            <form id="agent-form" class="agent-form">
+              <label>
+                <span>Name</span>
+                <input name="name" placeholder="Codex Builder" required />
+              </label>
+              <label>
+                <span>Command</span>
+                <input name="command" value="codex exec --stdin" required />
+              </label>
+              <div class="form-row two">
+                <label>
+                  <span>Role</span>
+                  <select name="role">
+                    <option value="implementation">Implementation</option>
+                    <option value="review">Review</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Slots</span>
+                  <input name="max_concurrent_tasks" type="number" min="1" value="1" />
+                </label>
+              </div>
+              <button class="secondary-button" type="submit">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+                Add agent
+              </button>
+            </form>
+            <div id="agents-list" class="stack-list"></div>
+          </article>
+
+          <article class="panel pipeline-panel" id="pipeline">
+            <div class="panel-heading">
+              <div>
+                <span class="eyebrow">Workflow</span>
+                <h3>Delivery pipeline</h3>
+              </div>
+            </div>
+            <div class="pipeline">
+              <div class="pipeline-step"><span>01</span><strong>Created</strong></div>
+              <div class="pipeline-step"><span>02</span><strong>Delegated</strong></div>
+              <div class="pipeline-step"><span>03</span><strong>PR</strong></div>
+              <div class="pipeline-step"><span>04</span><strong>Review</strong></div>
+              <div class="pipeline-step"><span>05</span><strong>Human</strong></div>
+              <div class="pipeline-step"><span>06</span><strong>CI watch</strong></div>
+            </div>
+          </article>
+        </section>
+
+        <section class="panel task-board" id="tasks">
+          <div class="panel-heading">
+            <div>
+              <span class="eyebrow">Queue</span>
+              <h3>Tasks</h3>
+            </div>
+            <div class="segmented" role="tablist" aria-label="Task filter">
+              <button class="active" data-filter="all" type="button">All</button>
+              <button data-filter="active" type="button">Active</button>
+              <button data-filter="review" type="button">Review</button>
+              <button data-filter="blocked" type="button">Needs work</button>
+            </div>
+          </div>
+          <div id="tasks-list" class="task-list"></div>
+        </section>
+      </main>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

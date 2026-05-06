@@ -1,0 +1,17 @@
+{
+  "workspaceBase": ".symphony/workspaces",
+  "stateFile": ".symphony/state.json",
+  "agentCommand": ["codex", "exec", "--stdin"],
+  "defaultRepoUrl": "git@github.com:yMScorpion/StratHUB.git",
+  "defaultAgentId": "codex",
+  "host": "127.0.0.1",
+  "port": 8765,
+  "pollIntervalSeconds": 30,
+  "maxAgents": 2,
+  "maxAgentStartsPerHour": 12,
+  "agentStartIntervalSeconds": 300,
+  "branchPrefix": "symphony",
+  "maxRetries": 1,
+  "autoPublishPrs": true,
+  "githubRemote": "origin"
+}
