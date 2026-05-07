@@ -76,3 +76,24 @@ services:
       interval: 5s
       timeout: 3s
       retries: 12
+
+  exec-rs:
+    build:
+      context: ../..
+      dockerfile: infra/docker/exec-rs.Dockerfile
+    container_name: cts-exec-rs
+    command:
+      [
+        "--mode=paper",
+        "--spec=/fixtures/wyckoff_spring_btc_15m.json",
+        "--account-id=local-paper",
+        "--validation-smoke",
+      ]
+    environment:
+      EXEC_EXCHANGE: binance
+      RUST_LOG: info
+    volumes:
+      - ../../packages/strategy-spec/fixtures:/fixtures:ro
+    depends_on:
+      api-ai:
+        condition: service_healthy

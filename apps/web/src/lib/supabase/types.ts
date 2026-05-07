@@ -58,6 +58,36 @@ export interface Database {
         Insert: Partial<Database["public"]["Tables"]["pdf_uploads"]["Row"]>;
         Update: Partial<Database["public"]["Tables"]["pdf_uploads"]["Row"]>;
       };
+      validation_runs: {
+        Row: {
+          id: string;
+          user_id: string;
+          strategy_id: string;
+          spec_hash: string;
+          mode: "paper";
+          exchange: "binance" | "bybit";
+          status: "provisioning" | "running" | "passed" | "failed" | "cancelled" | "error";
+          idempotency_key: string;
+          fly_app_name: string;
+          fly_machine_id: string | null;
+          fly_region: string;
+          fly_fallback_regions: string[];
+          lease_key: string;
+          ttl_expires_at: string;
+          estimated_cost_cents: number;
+          labels: Json;
+          scorecard_thresholds: Json;
+          scorecard_metrics: Json;
+          scorecard_result: Json;
+          started_at: string | null;
+          completed_at: string | null;
+          error: string | null;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: Partial<Database["public"]["Tables"]["validation_runs"]["Row"]>;
+        Update: Partial<Database["public"]["Tables"]["validation_runs"]["Row"]>;
+      };
     };
     Views: Record<string, never>;
     Functions: Record<string, never>;

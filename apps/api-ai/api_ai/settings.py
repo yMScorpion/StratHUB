@@ -39,6 +39,11 @@ class Settings(BaseSettings):
 
     # Concurrent validator cap (enforced in Phase 5)
     max_concurrent_validators: int = Field(default=5, ge=0, le=50)
+    max_validation_event_batch: int = Field(default=500, ge=1, le=5000)
+    validation_machine_ttl_hours: int = Field(default=168, ge=1, le=336)
+    validation_machine_estimated_cost_cents: int = Field(default=350, ge=0)
+    validation_monthly_budget_cents: int = Field(default=2500, ge=0)
+    fly_app_name: str = "cts-validators"
 
     # Shared secret the Next.js server must send in X-Internal-Token.
     # Must be overridden in production via INTERNAL_API_KEY env var.
