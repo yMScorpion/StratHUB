@@ -38,7 +38,7 @@ export async function createSupabaseServerClientReadonly() {
         getAll() {
           return cookieStore.getAll();
         },
-        setAll(_cookiesToSet: { name: string; value: string; options?: CookieOptions }[]) {
+        setAll() {
           /* readonly — no mutations */
         },
       },
