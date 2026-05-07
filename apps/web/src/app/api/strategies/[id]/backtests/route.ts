@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import type { Json } from "@/lib/supabase/types";
+import type { Database, Json } from "@/lib/supabase/types";
 
 type StrategySpec = {
   exchange?: string;
   symbols?: string[];
   timeframe?: string;
 };
+type BacktestInsert = Database["public"]["Tables"]["backtests"]["Insert"];
 
 export async function POST(
   request: Request,
@@ -83,7 +84,7 @@ export async function POST(
     );
   }
 
-  const backtestPayload = {
+  const backtestPayload: BacktestInsert = {
     user_id: user.id,
     strategy_id: strategy.id,
     spec_hash: strategy.spec_hash,
@@ -102,7 +103,7 @@ export async function POST(
 
   const { data: backtestRaw, error: backtestError } = await supabase
     .from("backtests")
-    .upsert(backtestPayload, {
+    .upsert([backtestPayload] as never[], {
       onConflict: "strategy_id,spec_hash,data_snapshot_id,initial_equity",
     })
     .select("id, status, data_snapshot_id, initial_equity")
