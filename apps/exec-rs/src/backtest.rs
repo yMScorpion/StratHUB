@@ -505,12 +505,14 @@ pub fn run_backtest(
                 close_position(
                     &mut equity,
                     &mut trades,
-                    &symbol,
-                    pos,
-                    c,
-                    execution_price(c.close, snapshot.slippage.bps, exit_buy),
-                    "delisting",
-                    snapshot,
+                    ClosePosition {
+                        symbol: &symbol,
+                        pos,
+                        candle: c,
+                        exit_price: execution_price(c.close, snapshot.slippage.bps, exit_buy),
+                        exit_reason: "delisting",
+                        snapshot,
+                    },
                 );
             }
             push_equity(&mut equity_curve, c, equity, &mut peak);
@@ -553,12 +555,14 @@ pub fn run_backtest(
                 close_position(
                     &mut equity,
                     &mut trades,
-                    &symbol,
-                    pos,
-                    c,
-                    execution_price(price, snapshot.slippage.bps, exit_buy),
-                    reason,
-                    snapshot,
+                    ClosePosition {
+                        symbol: &symbol,
+                        pos,
+                        candle: c,
+                        exit_price: execution_price(price, snapshot.slippage.bps, exit_buy),
+                        exit_reason: reason,
+                        snapshot,
+                    },
                 );
             } else {
                 position = Some(pos);
@@ -595,12 +599,14 @@ pub fn run_backtest(
         close_position(
             &mut equity,
             &mut trades,
-            &symbol,
-            pos,
-            last,
-            execution_price(last.close, snapshot.slippage.bps, exit_buy),
-            "end_of_data",
-            snapshot,
+            ClosePosition {
+                symbol: &symbol,
+                pos,
+                candle: last,
+                exit_price: execution_price(last.close, snapshot.slippage.bps, exit_buy),
+                exit_reason: "end_of_data",
+                snapshot,
+            },
         );
         equity_curve.pop();
         push_equity(&mut equity_curve, last, equity, &mut peak);
@@ -626,16 +632,24 @@ pub fn run_backtest(
     })
 }
 
-fn close_position(
-    equity: &mut Decimal,
-    trades: &mut Vec<Trade>,
-    symbol: &str,
+struct ClosePosition<'a> {
+    symbol: &'a str,
     pos: Position,
-    candle: &Candle,
+    candle: &'a Candle,
     exit_price: Decimal,
-    exit_reason: &str,
-    snapshot: &MarketSnapshot,
-) {
+    exit_reason: &'a str,
+    snapshot: &'a MarketSnapshot,
+}
+
+fn close_position(equity: &mut Decimal, trades: &mut Vec<Trade>, close: ClosePosition<'_>) {
+    let ClosePosition {
+        symbol,
+        pos,
+        candle,
+        exit_price,
+        exit_reason,
+        snapshot,
+    } = close;
     let notional_in = pos.qty * pos.entry_price;
     let notional_out = pos.qty * exit_price;
     let gross_pnl = if pos.side.is_long() {

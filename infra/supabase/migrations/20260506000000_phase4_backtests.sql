@@ -75,9 +75,3 @@ CREATE POLICY "users can create their own backtests"
   ON backtests FOR INSERT
   TO authenticated
   WITH CHECK (auth.uid() = user_id);
-
-CREATE POLICY "users can update their own backtests"
-  ON backtests FOR UPDATE
-  TO authenticated
-  USING (auth.uid() = user_id)
-  WITH CHECK (auth.uid() = user_id);
