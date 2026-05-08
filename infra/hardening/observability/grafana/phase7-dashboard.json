@@ -1,0 +1,44 @@
+{
+  "title": "StratHUB Phase 7 Hardening",
+  "tags": ["strathub", "phase7", "hardening"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "panels": [
+    {
+      "title": "Queue Depth",
+      "type": "timeseries",
+      "targets": [{"expr": "queue_depth"}]
+    },
+    {
+      "title": "LLM Cost/User",
+      "type": "timeseries",
+      "targets": [{"expr": "sum by (user_id) (increase(llm_cost_cents_total[1h]))"}]
+    },
+    {
+      "title": "Validator Fleet",
+      "type": "stat",
+      "targets": [{"expr": "sum(validator_runs_active)"}]
+    },
+    {
+      "title": "Fill Latency",
+      "type": "timeseries",
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, exchange) (rate(fill_latency_seconds_bucket[5m])))"}]
+    },
+    {
+      "title": "Clock Skew",
+      "type": "timeseries",
+      "targets": [{"expr": "max by (machine_id, region) (clock_skew_seconds)"}]
+    },
+    {
+      "title": "4xx/5xx By Exchange",
+      "type": "timeseries",
+      "targets": [{"expr": "sum by (exchange, status_class) (rate(exchange_http_responses_total{status_class=~\"4xx|5xx\"}[5m]))"}]
+    },
+    {
+      "title": "Pooler Holds",
+      "type": "timeseries",
+      "targets": [{"expr": "pgbouncer_waiting_clients"}]
+    }
+  ]
+}

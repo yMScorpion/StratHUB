@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "default_rule": "Tenant-owned rows are isolated by user_id = auth.uid(); profiles use id = auth.uid(); PDF storage uses the first path segment as auth.uid().",
+  "roles": ["anon", "authenticated_owner", "authenticated_other_tenant", "service_role"],
+  "tables": [
+    {
+      "name": "profiles",
+      "tenant_column": "id",
+      "owner": {"select": true, "insert": false, "update": true, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Inserted only by handle_new_user() security definer trigger."
+    },
+    {
+      "name": "api_keys",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": true, "update": true, "delete": true},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Plaintext keys are never stored."
+    },
+    {
+      "name": "risk_limits",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": true, "update": true, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false}
+    },
+    {
+      "name": "strategy_jobs",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": true, "update": true, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false}
+    },
+    {
+      "name": "pdf_uploads",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": true, "update": true, "delete": true},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false}
+    },
+    {
+      "name": "strategy_embeddings",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": false, "update": false, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Written by api-ai service role only."
+    },
+    {
+      "name": "strategies",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": true, "update": true, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false}
+    },
+    {
+      "name": "backtests",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": true, "update": false, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Created by approved strategy action; result rows are immutable after completion."
+    },
+    {
+      "name": "validation_runs",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": true, "update": true, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Executor telemetry updates arrive through service event-ingest."
+    },
+    {
+      "name": "accounts",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": true, "update": true, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false}
+    },
+    {
+      "name": "positions",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": false, "update": false, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Written only by reconciliation/event-ingest service role."
+    },
+    {
+      "name": "order_outbox",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": false, "update": false, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Live executor owns writes; users can observe but not forge orders."
+    },
+    {
+      "name": "trades",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": false, "update": false, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Append-only service role writes."
+    },
+    {
+      "name": "fills",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": false, "update": false, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Append-only service role writes from broker reconciliation."
+    },
+    {
+      "name": "audit_log",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": false, "update": false, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Append-only; admin review uses separate elevated path."
+    },
+    {
+      "name": "heartbeats_validator",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": false, "update": false, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Batched telemetry writes only; users read their own heartbeat rollups."
+    }
+  ],
+  "storage": [
+    {
+      "bucket": "pdfs",
+      "path_rule": "pdfs/{user_id}/{job_id}/{upload_id}.pdf",
+      "owner": {"select": true, "insert": true, "update": false, "delete": true},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false}
+    }
+  ],
+  "required_assertions_per_object": [
+    "anon cannot read, insert, update, or delete",
+    "owner can perform only the allowed operations above",
+    "other tenant cannot read rows by id, list rows, mutate rows, or infer existence through delete/update counts",
+    "service_role bypass is restricted to server-side code paths and never exposed to browsers or validator VMs"
+  ]
+}

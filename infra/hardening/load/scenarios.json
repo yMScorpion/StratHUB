@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "objectives": [
+    {
+      "name": "50-pdf-batch",
+      "owner": "api-ai",
+      "target": "POST /jobs, POST /jobs/{id}/pdfs x50, POST /jobs/{id}/submit",
+      "concurrency": 10,
+      "batch_size": 50,
+      "acceptance": {
+        "p95_register_pdf_ms": 500,
+        "p95_submit_ms": 750,
+        "error_rate_max": 0.01,
+        "notes": "All rejected files must be deterministic 4xx; no 5xx under max PDF count."
+      },
+      "metrics": [
+        "queue_depth{queue=\"ingest\"}",
+        "pdf_pages_ocr_total",
+        "llm_tokens_total",
+        "llm_cost_cents_total"
+      ]
+    },
+    {
+      "name": "200-concurrent-backtests",
+      "owner": "exec-rs",
+      "target": "exec-rs --mode backtest",
+      "concurrency": 200,
+      "acceptance": {
+        "startup_p95_ms": 2000,
+        "completed_without_panic": true,
+        "result_determinism": "same spec_hash and data_snapshot_id produce byte-identical summary"
+      },
+      "metrics": [
+        "backtest_runs_active",
+        "backtest_duration_seconds",
+        "executor_errors_total"
+      ]
+    },
+    {
+      "name": "50-concurrent-validators",
+      "owner": "validator-fleet",
+      "target": "exec-rs --mode paper",
+      "concurrency": 50,
+      "acceptance": {
+        "heartbeat_lag_p95_seconds": 10,
+        "event_ingest_5xx_rate_max": 0.005,
+        "validator_restarts_max": 1
+      },
+      "metrics": [
+        "validator_runs_active",
+        "validator_heartbeat_lag_seconds",
+        "event_ingest_batch_size",
+        "event_ingest_errors_total"
+      ]
+    },
+    {
+      "name": "pooler-holds",
+      "owner": "platform",
+      "target": "Supabase transaction pooler via event-ingest API only",
+      "concurrency": 50,
+      "acceptance": {
+        "direct_vm_postgres_connections": 0,
+        "pooler_wait_p95_ms": 50,
+        "pooler_saturation_minutes": 0
+      },
+      "metrics": [
+        "pgbouncer_active_clients",
+        "pgbouncer_waiting_clients",
+        "postgres_connections",
+        "event_ingest_db_transactions_total"
+      ]
+    }
+  ],
+  "evidence_required": [
+    "Grafana snapshot link for each objective",
+    "raw load runner output",
+    "incident notes for any threshold breach",
+    "git SHA and image digest under test"
+  ]
+}
