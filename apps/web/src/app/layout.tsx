@@ -3,14 +3,18 @@ import type { ReactNode } from "react";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Crypto Trading System",
+  title: "StratHUB",
   description: "AI-driven strategy compilation, backtesting, validation, and execution.",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <div className="app-shell">
+          {children}
+        </div>
+      </body>
     </html>
   );
 }

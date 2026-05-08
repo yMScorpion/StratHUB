@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { createSupabaseBrowserClient } from "@/lib/supabase/client";
 
 export default function LoginPage() {
@@ -29,40 +30,60 @@ export default function LoginPage() {
   }
 
   return (
-    <main style={{ padding: "4rem", maxWidth: 400, margin: "0 auto" }}>
-      <h1 style={{ fontWeight: 600, fontSize: "1.5rem", marginBottom: "1.5rem" }}>
-        Sign in to StratHUB
-      </h1>
+    <main className="fade-in">
+      <nav aria-label="Primary" className="topbar">
+        <Link className="brand" href="/">
+          <span className="brand-mark" aria-hidden="true">S</span>
+          <span>StratHUB</span>
+        </Link>
+        <div className="topnav">
+          <Link className="nav-link" href="/hub">Hub</Link>
+          <Link className="nav-link" href="/hub/new">Upload</Link>
+          <Link className="nav-link" href="/login">Sign in</Link>
+        </div>
+      </nav>
+
+      <section className="split-auth" aria-labelledby="login-title">
+        <div className="hero">
+          <div>
+            <p className="eyebrow">Secure access</p>
+            <h1 className="page-title" id="login-title">Sign in to StratHUB</h1>
+            <p className="lede">
+              Use a magic link to access strategy compilation, review, and validation workflows.
+            </p>
+          </div>
+        </div>
+        <div className="panel panel-pad">
       {sent ? (
-        <p style={{ color: "#22c55e" }}>Check your email for the magic link.</p>
+        <div className="success-note" role="status">
+          <h2 className="section-title">Check your email</h2>
+          <p>The magic link is on its way.</p>
+        </div>
       ) : (
-        <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: "1rem" }}>
+        <form className="form-stack" onSubmit={handleSubmit}>
+          <label className="subtle" htmlFor="email">Email address</label>
           <input
+            className="input"
+            id="email"
             type="email"
             required
             placeholder="you@example.com"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            style={{ padding: "0.6rem 0.8rem", fontSize: "1rem", borderRadius: 6, border: "1px solid #ccc" }}
           />
           <button
+            className="button"
             type="submit"
             disabled={loading}
-            style={{
-              padding: "0.6rem 1rem",
-              background: "#2563eb",
-              color: "#fff",
-              border: "none",
-              borderRadius: 6,
-              cursor: "pointer",
-              fontSize: "1rem",
-            }}
+            aria-busy={loading}
           >
-            {loading ? "Sending…" : "Send magic link"}
+            {loading ? "Sending..." : "Send magic link"}
           </button>
-          {error && <p style={{ color: "#ef4444" }}>{error}</p>}
+          {error && <p className="alert" role="alert">{error}</p>}
         </form>
       )}
+        </div>
+      </section>
     </main>
   );
 }
