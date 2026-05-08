@@ -3,10 +3,10 @@ from __future__ import annotations
 import datetime as dt
 from unittest.mock import MagicMock
 
+from fastapi import status
 from fastapi.testclient import TestClient
 
 from api_ai.main import create_app
-
 
 HEADERS = {
     "X-User-Id": "00000000-0000-0000-0000-000000000001",
@@ -48,7 +48,7 @@ def test_event_ingest_batches_and_updates_heartbeat() -> None:
         },
     )
 
-    assert r.status_code == 202, r.text
+    assert r.status_code == status.HTTP_202_ACCEPTED, r.text
     assert r.json() == {"accepted": 2, "last_seq": 2}
     sb.table.assert_any_call("validation_events")
     sb.table.assert_any_call("validation_heartbeats")
@@ -73,7 +73,7 @@ def test_scorecard_explains_failure_not_pnl_only() -> None:
         },
     )
 
-    assert r.status_code == 200, r.text
+    assert r.status_code == status.HTTP_200_OK, r.text
     body = r.json()
     assert body["status"] == "failed"
     assert body["passed"] is False
@@ -82,11 +82,11 @@ def test_scorecard_explains_failure_not_pnl_only() -> None:
 
 def test_provision_validation_pins_region_and_returns_ttl_labels() -> None:
     sb = MagicMock()
-    sb.table.return_value.select.return_value.eq.return_value.in_.return_value.execute.return_value = MagicMock(
-        count=0
-    )
-    sb.table.return_value.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[])
-    sb.table.return_value.upsert.return_value.execute.return_value = MagicMock(
+    query = sb.table.return_value.select.return_value.eq.return_value
+    query.in_.return_value.execute.return_value = MagicMock(count=0)
+    query.eq.return_value.limit.return_value.execute.return_value = MagicMock(data=[])
+    query.gte.return_value.lt.return_value.execute.return_value = MagicMock(data=[])
+    sb.table.return_value.insert.return_value.execute.return_value = MagicMock(
         data=[{"id": "val-1", "status": "provisioning"}]
     )
 
@@ -101,12 +101,75 @@ def test_provision_validation_pins_region_and_returns_ttl_labels() -> None:
         },
     )
 
-    assert r.status_code == 201, r.text
+    assert r.status_code == status.HTTP_201_CREATED, r.text
     machine = r.json()["machine"]
     assert machine["region"] == "nrt"
     assert machine["fallback_regions"] == ["sin", "hkg"]
     assert machine["labels"]["mode"] == "paper"
     assert machine["ttl_expires_at"]
+
+
+def test_provision_validation_idempotent_retry_bypasses_concurrency_cap() -> None:
+    sb = MagicMock()
+    query = sb.table.return_value.select.return_value.eq.return_value
+    query.eq.return_value.limit.return_value.execute.return_value = MagicMock(
+        data=[
+            {
+                "id": "val-1",
+                "status": "running",
+                "fly_region": "nrt",
+                "fly_fallback_regions": ["sin", "hkg"],
+                "lease_key": "validation:user:idem-1",
+                "ttl_expires_at": "2026-05-14T00:00:00+00:00",
+                "labels": {"mode": "paper"},
+            }
+        ]
+    )
+    query.in_.return_value.execute.return_value = MagicMock(count=99)
+
+    r = _client(sb).post(
+        "/validations",
+        headers=HEADERS,
+        json={
+            "strategy_id": "strategy-1",
+            "spec_hash": "a" * 64,
+            "exchange": "binance",
+            "idempotency_key": "idem-1",
+        },
+    )
+
+    assert r.status_code == status.HTTP_201_CREATED, r.text
+    assert r.json()["validation_id"] == "val-1"
+    assert r.json()["status"] == "running"
+    sb.table.return_value.insert.assert_not_called()
+
+
+def test_provision_validation_monthly_budget_uses_current_period() -> None:
+    sb = MagicMock()
+    query = sb.table.return_value.select.return_value.eq.return_value
+    query.eq.return_value.limit.return_value.execute.return_value = MagicMock(data=[])
+    query.in_.return_value.execute.return_value = MagicMock(count=0)
+    query.gte.return_value.lt.return_value.execute.return_value = MagicMock(
+        data=[{"estimated_cost_cents": 200}]
+    )
+    sb.table.return_value.insert.return_value.execute.return_value = MagicMock(
+        data=[{"id": "val-1", "status": "provisioning"}]
+    )
+
+    r = _client(sb).post(
+        "/validations",
+        headers=HEADERS,
+        json={
+            "strategy_id": "strategy-1",
+            "spec_hash": "a" * 64,
+            "exchange": "binance",
+            "idempotency_key": "idem-1",
+        },
+    )
+
+    assert r.status_code == status.HTTP_201_CREATED, r.text
+    budget_query = sb.table.return_value.select.return_value.eq.return_value.gte.return_value
+    budget_query.lt.assert_called_once()
 
 
 def test_janitor_marks_orphaned_and_expired_machines() -> None:
@@ -132,5 +195,5 @@ def test_janitor_marks_orphaned_and_expired_machines() -> None:
         },
     )
 
-    assert r.status_code == 200, r.text
+    assert r.status_code == status.HTTP_200_OK, r.text
     assert r.json()["destroy_machine_ids"] == ["expired", "orphan"]
