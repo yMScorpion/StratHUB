@@ -510,6 +510,395 @@ pub fn janitor_destroy_list(
         .collect()
 }
 
+// ---- Phase 6: Live Mode + Safeguards ----
+
+impl Exchange {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Binance => "binance",
+            Self::Bybit => "bybit",
+        }
+    }
+}
+
+impl Side {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Buy => "BUY",
+            Self::Sell => "SELL",
+        }
+    }
+}
+
+// KMS envelope decryption (AES-256-GCM).
+// In production: cloud KMS decrypts the DEK; the DEK decrypts the broker key.
+// The executor receives only dek_hex (from KMS.Decrypt), nonce_hex, and ciphertext_hex.
+
+#[derive(Debug, thiserror::Error)]
+pub enum KmsError {
+    #[error("invalid DEK length: expected 32 bytes")]
+    InvalidDekLength,
+    #[error("invalid nonce length: expected 12 bytes")]
+    InvalidNonceLength,
+    #[error("hex decode error: {0}")]
+    HexDecode(String),
+    #[error("decryption failed: authentication tag mismatch or corrupted ciphertext")]
+    DecryptionFailed,
+    #[error("decrypted key is not valid UTF-8")]
+    InvalidUtf8,
+    #[error("scope violation: {0}")]
+    ScopeViolation(String),
+}
+
+pub fn decrypt_broker_key(
+    dek_hex: &str,
+    nonce_hex: &str,
+    ciphertext_hex: &str,
+) -> Result<String, KmsError> {
+    use aes_gcm::{
+        aead::{Aead, KeyInit},
+        Aes256Gcm, Key, Nonce,
+    };
+
+    let dek = hex::decode(dek_hex).map_err(|e| KmsError::HexDecode(e.to_string()))?;
+    let nonce_bytes = hex::decode(nonce_hex).map_err(|e| KmsError::HexDecode(e.to_string()))?;
+    let ciphertext = hex::decode(ciphertext_hex).map_err(|e| KmsError::HexDecode(e.to_string()))?;
+
+    if dek.len() != 32 {
+        return Err(KmsError::InvalidDekLength);
+    }
+    if nonce_bytes.len() != 12 {
+        return Err(KmsError::InvalidNonceLength);
+    }
+
+    let key = Key::<Aes256Gcm>::from_slice(&dek);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext.as_ref())
+        .map_err(|_| KmsError::DecryptionFailed)?;
+
+    String::from_utf8(plaintext).map_err(|_| KmsError::InvalidUtf8)
+}
+
+pub fn encrypt_broker_key(
+    dek_hex: &str,
+    nonce_hex: &str,
+    plaintext: &str,
+) -> Result<String, KmsError> {
+    use aes_gcm::{
+        aead::{Aead, KeyInit},
+        Aes256Gcm, Key, Nonce,
+    };
+
+    let dek = hex::decode(dek_hex).map_err(|e| KmsError::HexDecode(e.to_string()))?;
+    let nonce_bytes = hex::decode(nonce_hex).map_err(|e| KmsError::HexDecode(e.to_string()))?;
+
+    if dek.len() != 32 {
+        return Err(KmsError::InvalidDekLength);
+    }
+    if nonce_bytes.len() != 12 {
+        return Err(KmsError::InvalidNonceLength);
+    }
+
+    let key = Key::<Aes256Gcm>::from_slice(&dek);
+    let cipher = Aes256Gcm::new(key);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .map_err(|_| KmsError::DecryptionFailed)?;
+
+    Ok(hex::encode(ciphertext))
+}
+
+// Broker credentials: loaded at process start after KMS decrypt; never persisted in plaintext.
+
+#[derive(Debug, Clone)]
+pub struct BrokerCredentials {
+    pub api_key: String,
+    pub api_secret: String,
+    pub scope: Vec<String>,
+}
+
+impl BrokerCredentials {
+    pub fn verify_scope(&self) -> Result<(), KmsError> {
+        if !self.scope.iter().any(|s| s == "trade") {
+            return Err(KmsError::ScopeViolation("trade scope missing".to_string()));
+        }
+        if self.scope.iter().any(|s| s == "withdraw") {
+            return Err(KmsError::ScopeViolation(
+                "withdraw scope must not be granted on live keys".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// Jurisdiction + ToS + risk-ack gate. All three must be present before "Go Live" is offered.
+
+#[derive(Debug, thiserror::Error)]
+pub enum ComplianceError {
+    #[error("jurisdiction not recorded; complete profile settings before going live")]
+    NoJurisdiction,
+    #[error("terms of service not accepted")]
+    TosNotAccepted,
+    #[error("risk acknowledgement not completed")]
+    RiskAckMissing,
+}
+
+#[derive(Debug, Clone)]
+pub struct ComplianceRecord {
+    pub user_id: String,
+    pub jurisdiction: Option<String>,
+    pub tos_accepted_at: Option<DateTime<Utc>>,
+    pub risk_ack_at: Option<DateTime<Utc>>,
+}
+
+pub fn check_compliance_gate(record: &ComplianceRecord) -> Result<(), ComplianceError> {
+    if record.jurisdiction.is_none() {
+        return Err(ComplianceError::NoJurisdiction);
+    }
+    if record.tos_accepted_at.is_none() {
+        return Err(ComplianceError::TosNotAccepted);
+    }
+    if record.risk_ack_at.is_none() {
+        return Err(ComplianceError::RiskAckMissing);
+    }
+    Ok(())
+}
+
+// Hold-to-confirm: token = sha256(spec_hash:account_id:exchange).
+// Pre-computed by the API layer and passed as EXEC_CONFIRM_TOKEN. Binding the
+// token to spec_hash + account_id + exchange means any parameter change invalidates it.
+
+pub struct ConfirmationGate;
+
+impl ConfirmationGate {
+    pub fn expected_token(spec_hash: &str, account_id: &str, exchange: Exchange) -> String {
+        use sha2::{Digest, Sha256};
+        let input = format!("{spec_hash}:{account_id}:{}", exchange.as_str());
+        hex::encode(Sha256::digest(input.as_bytes()))
+    }
+
+    pub fn verify(provided: &str, spec_hash: &str, account_id: &str, exchange: Exchange) -> bool {
+        provided == Self::expected_token(spec_hash, account_id, exchange)
+    }
+}
+
+// Append-only audit log: one JSONL entry per live action.
+// Written to a local file; flushed on every write so a crash loses at most one entry.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub ts: DateTime<Utc>,
+    pub user_id: String,
+    pub run_id: String,
+    pub spec_hash: String,
+    pub exchange: Exchange,
+    pub action: String,
+    pub payload: serde_json::Value,
+    pub result: String,
+}
+
+pub struct AuditLog {
+    path: std::path::PathBuf,
+}
+
+impl AuditLog {
+    pub fn new(dir: &std::path::Path, run_id: &str) -> Self {
+        Self {
+            path: dir.join(format!("{run_id}-audit.jsonl")),
+        }
+    }
+
+    pub fn write(&self, entry: &AuditEntry) -> Result<(), std::io::Error> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        writeln!(f, "{}", serde_json::to_string(entry).unwrap())?;
+        Ok(())
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+// Live position state: signed qty per symbol (+ = long, - = short).
+
+#[derive(Debug, Default, Clone)]
+pub struct LivePositionState {
+    pub positions: BTreeMap<String, Decimal>,
+    pub equity: Decimal,
+    pub start_of_day_equity: Decimal,
+}
+
+impl LivePositionState {
+    pub fn update_fill(&mut self, symbol: &str, side: Side, qty: Decimal) {
+        let entry = self.positions.entry(symbol.to_string()).or_default();
+        match side {
+            Side::Buy => *entry += qty,
+            Side::Sell => *entry -= qty,
+        }
+        if *entry == Decimal::ZERO {
+            self.positions.remove(symbol);
+        }
+    }
+
+    pub fn open_symbols(&self) -> Vec<String> {
+        self.positions.keys().cloned().collect()
+    }
+
+    pub fn is_flat(&self) -> bool {
+        self.positions.is_empty()
+    }
+
+    pub fn gross_position_pct(&self) -> Decimal {
+        if self.equity.is_zero() {
+            return Decimal::ZERO;
+        }
+        let gross: Decimal = self.positions.values().map(|q| q.abs()).sum();
+        (gross / self.equity) * dec!(100)
+    }
+}
+
+// Local risk cache: used when DB/API is unreachable. Fails closed (activates kill-switch)
+// after `stale_after_secs` without a successful refresh.
+
+#[derive(Debug, Clone)]
+pub struct LocalRiskCache {
+    pub limits: RiskLimits,
+    pub last_updated: DateTime<Utc>,
+    pub stale_after_secs: u64,
+}
+
+impl LocalRiskCache {
+    pub fn new(limits: RiskLimits, stale_after_secs: u64) -> Self {
+        Self {
+            limits,
+            last_updated: Utc::now(),
+            stale_after_secs,
+        }
+    }
+
+    pub fn is_stale(&self) -> bool {
+        let age_secs = (Utc::now() - self.last_updated).num_seconds().max(0) as u64;
+        age_secs > self.stale_after_secs
+    }
+
+    pub fn effective_limits(&self) -> RiskLimits {
+        if self.is_stale() {
+            RiskLimits {
+                kill_switch_active: true,
+                ..self.limits.clone()
+            }
+        } else {
+            self.limits.clone()
+        }
+    }
+}
+
+// Kill-switch action spec: always cancels all open orders; optionally flattens positions.
+
+#[derive(Debug, Clone)]
+pub struct KillSwitchAction {
+    pub cancel_all: bool,
+    pub flatten_positions: bool,
+    pub triggered_at: DateTime<Utc>,
+    pub reason: String,
+}
+
+impl KillSwitchAction {
+    pub fn new(flatten: bool, reason: impl Into<String>) -> Self {
+        Self {
+            cancel_all: true,
+            flatten_positions: flatten,
+            triggered_at: Utc::now(),
+            reason: reason.into(),
+        }
+    }
+}
+
+// Fill reconciliation: compares what the local outbox recorded against the exchange report.
+
+#[derive(Debug, Clone)]
+pub struct ReconciliationCheck {
+    pub client_order_id: Uuid,
+    pub local_symbol: String,
+    pub local_side: Side,
+    pub local_qty: Decimal,
+    pub local_price: Decimal,
+    pub exchange_symbol: String,
+    pub exchange_side: Side,
+    pub exchange_qty: Decimal,
+    pub exchange_price: Decimal,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReconciliationResult {
+    Matched,
+    SymbolMismatch {
+        local: String,
+        exchange: String,
+    },
+    SideMismatch {
+        local: Side,
+        exchange: Side,
+    },
+    QtyMismatch {
+        local: Decimal,
+        exchange: Decimal,
+        diff: Decimal,
+    },
+    PriceDriftExcessive {
+        diff_bps: Decimal,
+    },
+}
+
+impl ReconciliationResult {
+    pub fn is_matched(&self) -> bool {
+        matches!(self, Self::Matched)
+    }
+}
+
+pub fn reconcile_fill(
+    check: &ReconciliationCheck,
+    max_price_diff_bps: Decimal,
+) -> ReconciliationResult {
+    if check.local_symbol != check.exchange_symbol {
+        return ReconciliationResult::SymbolMismatch {
+            local: check.local_symbol.clone(),
+            exchange: check.exchange_symbol.clone(),
+        };
+    }
+    if check.local_side != check.exchange_side {
+        return ReconciliationResult::SideMismatch {
+            local: check.local_side,
+            exchange: check.exchange_side,
+        };
+    }
+    let qty_diff = (check.local_qty - check.exchange_qty).abs();
+    if qty_diff > Decimal::ZERO {
+        return ReconciliationResult::QtyMismatch {
+            local: check.local_qty,
+            exchange: check.exchange_qty,
+            diff: qty_diff,
+        };
+    }
+    if check.exchange_price > Decimal::ZERO {
+        let diff_bps =
+            ((check.local_price - check.exchange_price).abs() / check.exchange_price) * dec!(10000);
+        if diff_bps > max_price_diff_bps {
+            return ReconciliationResult::PriceDriftExcessive { diff_bps };
+        }
+    }
+    ReconciliationResult::Matched
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -636,6 +1025,270 @@ mod tests {
             ..spec
         };
         assert!(plan_fly_machine(&over_budget, 168).is_err());
+    }
+
+    #[test]
+    fn kms_encrypt_decrypt_round_trip() {
+        let dek_hex = "00".repeat(32);
+        let nonce_hex = "00".repeat(12);
+        let plaintext = "LIVE_API_KEY_abc123XYZ";
+
+        let ciphertext_hex = encrypt_broker_key(&dek_hex, &nonce_hex, plaintext).unwrap();
+        let recovered = decrypt_broker_key(&dek_hex, &nonce_hex, &ciphertext_hex).unwrap();
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn kms_decrypt_wrong_tag_fails_closed() {
+        let dek_hex = "00".repeat(32);
+        let nonce_hex = "00".repeat(12);
+        let plaintext = "secret-api-key";
+        let ciphertext_hex = encrypt_broker_key(&dek_hex, &nonce_hex, plaintext).unwrap();
+
+        // corrupt one byte of the ciphertext
+        let mut bytes = hex::decode(&ciphertext_hex).unwrap();
+        bytes[0] ^= 0xFF;
+        let bad_hex = hex::encode(bytes);
+
+        assert!(matches!(
+            decrypt_broker_key(&dek_hex, &nonce_hex, &bad_hex),
+            Err(KmsError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn broker_credentials_enforce_trade_only_scope() {
+        let trade_only = BrokerCredentials {
+            api_key: "key".to_string(),
+            api_secret: "secret".to_string(),
+            scope: vec!["trade".to_string()],
+        };
+        assert!(trade_only.verify_scope().is_ok());
+
+        let with_withdraw = BrokerCredentials {
+            scope: vec!["trade".to_string(), "withdraw".to_string()],
+            ..trade_only.clone()
+        };
+        assert!(matches!(
+            with_withdraw.verify_scope(),
+            Err(KmsError::ScopeViolation(_))
+        ));
+
+        let no_trade = BrokerCredentials {
+            scope: vec!["read".to_string()],
+            ..trade_only
+        };
+        assert!(matches!(
+            no_trade.verify_scope(),
+            Err(KmsError::ScopeViolation(_))
+        ));
+    }
+
+    #[test]
+    fn compliance_gate_requires_jurisdiction_tos_and_risk_ack() {
+        let valid = ComplianceRecord {
+            user_id: "u1".to_string(),
+            jurisdiction: Some("US".to_string()),
+            tos_accepted_at: Some(Utc::now()),
+            risk_ack_at: Some(Utc::now()),
+        };
+        assert!(check_compliance_gate(&valid).is_ok());
+
+        let no_jurisdiction = ComplianceRecord {
+            jurisdiction: None,
+            ..valid.clone()
+        };
+        assert!(matches!(
+            check_compliance_gate(&no_jurisdiction),
+            Err(ComplianceError::NoJurisdiction)
+        ));
+
+        let no_tos = ComplianceRecord {
+            tos_accepted_at: None,
+            ..valid.clone()
+        };
+        assert!(matches!(
+            check_compliance_gate(&no_tos),
+            Err(ComplianceError::TosNotAccepted)
+        ));
+
+        let no_risk_ack = ComplianceRecord {
+            risk_ack_at: None,
+            ..valid
+        };
+        assert!(matches!(
+            check_compliance_gate(&no_risk_ack),
+            Err(ComplianceError::RiskAckMissing)
+        ));
+    }
+
+    #[test]
+    fn confirmation_gate_binds_to_spec_hash_account_and_exchange() {
+        let spec_hash = "a".repeat(64);
+        let account_id = "sub-account-50usd";
+
+        let token = ConfirmationGate::expected_token(&spec_hash, account_id, Exchange::Binance);
+        assert!(ConfirmationGate::verify(
+            &token,
+            &spec_hash,
+            account_id,
+            Exchange::Binance
+        ));
+
+        // Wrong token
+        assert!(!ConfirmationGate::verify(
+            "wrong",
+            &spec_hash,
+            account_id,
+            Exchange::Binance
+        ));
+        // Different spec_hash
+        assert!(!ConfirmationGate::verify(
+            &token,
+            &"b".repeat(64),
+            account_id,
+            Exchange::Binance
+        ));
+        // Different exchange
+        assert!(!ConfirmationGate::verify(
+            &token,
+            &spec_hash,
+            account_id,
+            Exchange::Bybit
+        ));
+    }
+
+    #[test]
+    fn audit_log_appends_jsonl_entries() {
+        use std::io::BufRead;
+        let dir = std::env::temp_dir().join("exec-rs-phase6-audit-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let log = AuditLog::new(&dir, "run-0001");
+        let entry = AuditEntry {
+            ts: Utc::now(),
+            user_id: "u1".to_string(),
+            run_id: "run-0001".to_string(),
+            spec_hash: "a".repeat(64),
+            exchange: Exchange::Binance,
+            action: "go_live".to_string(),
+            payload: serde_json::json!({"dry_run": false}),
+            result: "ok".to_string(),
+        };
+
+        log.write(&entry).unwrap();
+        log.write(&AuditEntry {
+            action: "kill_switch".to_string(),
+            ..entry
+        })
+        .unwrap();
+
+        let file = std::fs::File::open(log.path()).unwrap();
+        let lines: Vec<String> = std::io::BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("go_live"));
+        assert!(lines[1].contains("kill_switch"));
+    }
+
+    #[test]
+    fn local_risk_cache_fails_closed_when_stale() {
+        let limits = RiskLimits {
+            kill_switch_active: false,
+            max_daily_loss_pct: dec!(2),
+            max_position_pct: dec!(5),
+            max_concurrent_orders: 5,
+        };
+
+        let fresh = LocalRiskCache::new(limits.clone(), 300);
+        assert!(!fresh.is_stale());
+        assert!(!fresh.effective_limits().kill_switch_active);
+
+        let mut stale = LocalRiskCache::new(limits, 0);
+        stale.last_updated = Utc::now() - chrono::Duration::seconds(10);
+        assert!(stale.is_stale());
+        assert!(stale.effective_limits().kill_switch_active);
+    }
+
+    #[test]
+    fn live_position_tracks_fills_and_reports_flat() {
+        let mut pos = LivePositionState::default();
+        assert!(pos.is_flat());
+
+        pos.update_fill("BTCUSDT", Side::Buy, dec!(0.01));
+        assert!(!pos.is_flat());
+        assert_eq!(pos.positions["BTCUSDT"], dec!(0.01));
+
+        pos.update_fill("BTCUSDT", Side::Sell, dec!(0.01));
+        assert!(pos.is_flat());
+    }
+
+    #[test]
+    fn kill_switch_action_always_includes_cancel_all() {
+        let with_flatten = KillSwitchAction::new(true, "signal");
+        assert!(with_flatten.cancel_all);
+        assert!(with_flatten.flatten_positions);
+
+        let no_flatten = KillSwitchAction::new(false, "signal");
+        assert!(no_flatten.cancel_all);
+        assert!(!no_flatten.flatten_positions);
+    }
+
+    #[test]
+    fn reconcile_fill_detects_all_mismatch_kinds() {
+        let base = ReconciliationCheck {
+            client_order_id: Uuid::nil(),
+            local_symbol: "BTCUSDT".to_string(),
+            local_side: Side::Buy,
+            local_qty: dec!(0.001),
+            local_price: dec!(50000),
+            exchange_symbol: "BTCUSDT".to_string(),
+            exchange_side: Side::Buy,
+            exchange_qty: dec!(0.001),
+            exchange_price: dec!(50000),
+        };
+
+        assert!(reconcile_fill(&base, dec!(50)).is_matched());
+
+        let sym_mismatch = ReconciliationCheck {
+            exchange_symbol: "ETHUSDT".to_string(),
+            ..base.clone()
+        };
+        assert!(matches!(
+            reconcile_fill(&sym_mismatch, dec!(50)),
+            ReconciliationResult::SymbolMismatch { .. }
+        ));
+
+        let side_mismatch = ReconciliationCheck {
+            exchange_side: Side::Sell,
+            ..base.clone()
+        };
+        assert!(matches!(
+            reconcile_fill(&side_mismatch, dec!(50)),
+            ReconciliationResult::SideMismatch { .. }
+        ));
+
+        let qty_mismatch = ReconciliationCheck {
+            exchange_qty: dec!(0.002),
+            ..base.clone()
+        };
+        assert!(matches!(
+            reconcile_fill(&qty_mismatch, dec!(50)),
+            ReconciliationResult::QtyMismatch { .. }
+        ));
+
+        // ~20000 bps price drift (50000 vs 60000)
+        let price_drift = ReconciliationCheck {
+            local_price: dec!(60000),
+            ..base.clone()
+        };
+        assert!(matches!(
+            reconcile_fill(&price_drift, dec!(50)),
+            ReconciliationResult::PriceDriftExcessive { .. }
+        ));
     }
 
     #[test]

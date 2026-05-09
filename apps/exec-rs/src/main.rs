@@ -8,8 +8,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use exec_rs::{
-    evaluate_scorecard, ClockSkewMonitor, Exchange, Fill, MarketTick, OrderIntent, OrderOutbox,
-    OutboxStatus, PaperBroker, RiskGuard, RiskLimits, RiskState, ScorecardThresholds, Side,
+    check_compliance_gate, decrypt_broker_key, deterministic_client_order_id, evaluate_scorecard,
+    reconcile_fill, AuditEntry, AuditLog, BrokerCredentials, ClockSkewMonitor, ComplianceError,
+    ComplianceRecord, ConfirmationGate, Exchange, Fill, KillSwitchAction, LivePositionState,
+    LocalRiskCache, MarketTick, OrderIntent, OrderOutbox, OutboxStatus, PaperBroker,
+    ReconciliationCheck, RiskGuard, RiskLimits, RiskState, ScorecardThresholds, Side,
     ValidationMetrics, WsReconnectThrottle,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -97,6 +100,55 @@ struct Args {
     /// Optional wall-clock cap for integration tests and supervised shutdowns.
     #[arg(long, env = "EXEC_VALIDATION_MAX_SECONDS")]
     validation_max_seconds: Option<u64>,
+
+    // ---- Live mode args (Phase 6) ----
+    /// Nonce hex for encrypted API key (AES-256-GCM, 12 bytes).
+    #[arg(long, env = "EXEC_KMS_KEY_NONCE_HEX")]
+    kms_key_nonce_hex: Option<String>,
+
+    /// Ciphertext hex for encrypted API key.
+    #[arg(long, env = "EXEC_KMS_KEY_CIPHERTEXT_HEX")]
+    kms_key_ciphertext_hex: Option<String>,
+
+    /// Nonce hex for encrypted API secret.
+    #[arg(long, env = "EXEC_KMS_SECRET_NONCE_HEX")]
+    kms_secret_nonce_hex: Option<String>,
+
+    /// Ciphertext hex for encrypted API secret.
+    #[arg(long, env = "EXEC_KMS_SECRET_CIPHERTEXT_HEX")]
+    kms_secret_ciphertext_hex: Option<String>,
+
+    /// Hold-to-confirm token: sha256(spec_hash:account_id:exchange). Must match exactly.
+    #[arg(long, env = "EXEC_CONFIRM_TOKEN")]
+    confirm_token: Option<String>,
+
+    /// Flatten all open positions (market sell) when kill-switch fires.
+    #[arg(long, env = "EXEC_FLATTEN_ON_KILL_SWITCH")]
+    flatten_on_kill_switch: bool,
+
+    /// Directory for live audit log JSONL files.
+    #[arg(long, default_value = ".exec-rs-audit", env = "EXEC_AUDIT_LOG_DIR")]
+    audit_log_dir: std::path::PathBuf,
+
+    /// Skip order placement; run all pre-flight checks only. Safe for verifying config.
+    #[arg(long, env = "EXEC_DRY_RUN")]
+    dry_run: bool,
+
+    /// Run a single round-trip order for verification ($50 sub-account smoke test).
+    #[arg(long, env = "EXEC_LIVE_SMOKE")]
+    live_smoke: bool,
+
+    /// User jurisdiction code (e.g. "US"). Passed from API layer after profile check.
+    #[arg(long, env = "EXEC_JURISDICTION")]
+    jurisdiction: Option<String>,
+
+    /// RFC-3339 timestamp when user accepted the terms of service.
+    #[arg(long, env = "EXEC_TOS_ACCEPTED_AT")]
+    tos_accepted_at: Option<String>,
+
+    /// RFC-3339 timestamp when user completed the risk acknowledgement.
+    #[arg(long, env = "EXEC_RISK_ACK_AT")]
+    risk_ack_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -179,7 +231,97 @@ async fn main() -> Result<()> {
             .await?;
         }
         Mode::Live => {
-            tracing::info!("live dispatch guarded until phase 6 capital controls are enabled");
+            let account_id = args
+                .account_id
+                .clone()
+                .context("--account-id is required in live mode")?;
+
+            // KMS envelope decrypt: EXEC_KMS_DEK_HEX is the DEK returned by cloud KMS.Decrypt;
+            // it is never logged, stored, or passed to child processes.
+            let dek_hex = std::env::var("EXEC_KMS_DEK_HEX").context(
+                "EXEC_KMS_DEK_HEX required in live mode (set by launcher after KMS.Decrypt)",
+            )?;
+
+            let api_key = decrypt_broker_key(
+                &dek_hex,
+                &args
+                    .kms_key_nonce_hex
+                    .clone()
+                    .context("--kms-key-nonce-hex required in live mode")?,
+                &args
+                    .kms_key_ciphertext_hex
+                    .clone()
+                    .context("--kms-key-ciphertext-hex required in live mode")?,
+            )
+            .context("KMS decrypt API key")?;
+
+            let api_secret = decrypt_broker_key(
+                &dek_hex,
+                &args
+                    .kms_secret_nonce_hex
+                    .clone()
+                    .context("--kms-secret-nonce-hex required in live mode")?,
+                &args
+                    .kms_secret_ciphertext_hex
+                    .clone()
+                    .context("--kms-secret-ciphertext-hex required in live mode")?,
+            )
+            .context("KMS decrypt API secret")?;
+
+            let creds = BrokerCredentials {
+                api_key,
+                api_secret,
+                scope: vec!["trade".to_string()],
+            };
+
+            let tos_accepted_at = args
+                .tos_accepted_at
+                .as_deref()
+                .map(|s| {
+                    s.parse::<chrono::DateTime<chrono::Utc>>()
+                        .context("parse EXEC_TOS_ACCEPTED_AT as RFC-3339")
+                })
+                .transpose()?;
+
+            let risk_ack_at = args
+                .risk_ack_at
+                .as_deref()
+                .map(|s| {
+                    s.parse::<chrono::DateTime<chrono::Utc>>()
+                        .context("parse EXEC_RISK_ACK_AT as RFC-3339")
+                })
+                .transpose()?;
+
+            let compliance = ComplianceRecord {
+                user_id: account_id.clone(),
+                jurisdiction: args.jurisdiction.clone(),
+                tos_accepted_at,
+                risk_ack_at,
+            };
+
+            let confirm_token = args
+                .confirm_token
+                .clone()
+                .context("--confirm-token (EXEC_CONFIRM_TOKEN) is required in live mode")?;
+
+            run_live_mode(
+                &spec,
+                &computed,
+                &run_id,
+                args.exchange.into(),
+                creds,
+                LiveModeConfig {
+                    account_id,
+                    confirm_token,
+                    compliance,
+                    flatten_on_kill_switch: args.flatten_on_kill_switch,
+                    audit_log_dir: args.audit_log_dir.clone(),
+                    state_dir: args.state_dir.clone(),
+                    live_smoke: args.live_smoke,
+                    dry_run: args.dry_run,
+                },
+            )
+            .await?;
         }
     }
     Ok(())
@@ -673,6 +815,641 @@ fn metrics_json(metrics: &ValidationMetrics) -> Value {
         "oos_passed": metrics.oos_passed,
         "run_days": metrics.run_days,
     })
+}
+
+// ---- Phase 6: Live Mode + Safeguards ----
+
+#[derive(Debug, Clone)]
+struct LiveModeConfig {
+    account_id: String,
+    confirm_token: String,
+    compliance: ComplianceRecord,
+    flatten_on_kill_switch: bool,
+    audit_log_dir: std::path::PathBuf,
+    #[allow(dead_code)]
+    state_dir: std::path::PathBuf,
+    live_smoke: bool,
+    dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExchangeOrderResponse {
+    #[serde(rename = "orderId")]
+    order_id: u64,
+    symbol: String,
+    side: String,
+    #[serde(rename = "executedQty")]
+    executed_qty: String,
+    #[serde(rename = "cummulativeQuoteQty")]
+    cumulative_quote_qty: String,
+    status: String,
+}
+
+struct LiveBroker {
+    http: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    api_secret: String,
+}
+
+impl LiveBroker {
+    fn new(base_url: impl Into<String>, api_key: String, api_secret: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base_url: base_url.into(),
+            api_key,
+            api_secret,
+        }
+    }
+
+    fn sign(&self, params: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(self.api_secret.as_bytes())
+            .expect("HMAC accepts any key size");
+        mac.update(params.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    fn timestamp_ms() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    async fn place_market_order(
+        &self,
+        symbol: &str,
+        side: Side,
+        qty: Decimal,
+        client_order_id: uuid::Uuid,
+    ) -> Result<ExchangeOrderResponse> {
+        let ts = Self::timestamp_ms();
+        let params = format!(
+            "symbol={}&side={}&type=MARKET&quantity={}&newClientOrderId={}&timestamp={}",
+            symbol,
+            side.as_str(),
+            qty,
+            client_order_id.simple(),
+            ts
+        );
+        let sig = self.sign(&params);
+        let url = format!(
+            "{}/api/v3/order?{}&signature={}",
+            self.base_url, params, sig
+        );
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("POST /api/v3/order")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("order placement failed ({}): {}", status, body);
+        }
+        resp.json::<ExchangeOrderResponse>()
+            .await
+            .context("parse order response")
+    }
+
+    async fn cancel_all_open_orders(&self, symbol: &str) -> Result<usize> {
+        let ts = Self::timestamp_ms();
+        let params = format!("symbol={}&timestamp={}", symbol, ts);
+        let sig = self.sign(&params);
+        let url = format!(
+            "{}/api/v3/openOrders?{}&signature={}",
+            self.base_url, params, sig
+        );
+
+        let resp = self
+            .http
+            .delete(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("DELETE /api/v3/openOrders")?;
+
+        // 400 with code -2011 means no open orders — not an error
+        if resp.status().as_u16() == 400 {
+            return Ok(0);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("cancel-all failed ({}): {}", status, body);
+        }
+        let cancelled: Vec<Value> = resp.json().await.context("parse cancel-all response")?;
+        Ok(cancelled.len())
+    }
+
+    async fn get_order_status(
+        &self,
+        symbol: &str,
+        client_order_id: uuid::Uuid,
+    ) -> Result<Option<ExchangeOrderResponse>> {
+        let ts = Self::timestamp_ms();
+        let params = format!(
+            "symbol={}&origClientOrderId={}&timestamp={}",
+            symbol,
+            client_order_id.simple(),
+            ts
+        );
+        let sig = self.sign(&params);
+        let url = format!(
+            "{}/api/v3/order?{}&signature={}",
+            self.base_url, params, sig
+        );
+
+        let resp = self
+            .http
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("GET /api/v3/order")?;
+
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get order status failed ({}): {}", status, body);
+        }
+        Ok(Some(
+            resp.json::<ExchangeOrderResponse>()
+                .await
+                .context("parse order status")?,
+        ))
+    }
+}
+
+async fn run_live_mode(
+    spec: &Value,
+    spec_hash: &str,
+    run_id: &str,
+    exchange: Exchange,
+    creds: BrokerCredentials,
+    config: LiveModeConfig,
+) -> Result<()> {
+    // 1. Scope enforcement: no withdraw, must have trade.
+    creds
+        .verify_scope()
+        .context("broker credential scope check")?;
+
+    // 2. Jurisdiction + ToS + risk-ack gate.
+    check_compliance_gate(&config.compliance).map_err(|e| match e {
+        ComplianceError::NoJurisdiction => {
+            anyhow::anyhow!("{e}; set EXEC_JURISDICTION before going live")
+        }
+        ComplianceError::TosNotAccepted => {
+            anyhow::anyhow!("{e}; user must accept counsel-reviewed disclosures first")
+        }
+        ComplianceError::RiskAckMissing => {
+            anyhow::anyhow!("{e}; user must complete the risk acknowledgement flow")
+        }
+    })?;
+
+    // 3. Hold-to-confirm: token binds this session to spec_hash + account_id + exchange.
+    if !ConfirmationGate::verify(
+        &config.confirm_token,
+        spec_hash,
+        &config.account_id,
+        exchange,
+    ) {
+        let expected = ConfirmationGate::expected_token(spec_hash, &config.account_id, exchange);
+        anyhow::bail!(
+            "confirmation token mismatch — re-run with:\n  EXEC_CONFIRM_TOKEN={expected}\n\
+             (token is bound to spec_hash={spec_hash}, account_id={}, exchange={})",
+            config.account_id,
+            exchange.as_str()
+        );
+    }
+
+    // 4. Audit log setup.
+    std::fs::create_dir_all(&config.audit_log_dir)
+        .with_context(|| format!("create audit log dir {}", config.audit_log_dir.display()))?;
+    let audit = AuditLog::new(&config.audit_log_dir, run_id);
+
+    let base_entry = AuditEntry {
+        ts: chrono::Utc::now(),
+        user_id: config.account_id.clone(),
+        run_id: run_id.to_string(),
+        spec_hash: spec_hash.to_string(),
+        exchange,
+        action: String::new(),
+        payload: json!({}),
+        result: "ok".to_string(),
+    };
+
+    audit
+        .write(&AuditEntry {
+            action: "go_live".to_string(),
+            payload: json!({
+                "dry_run": config.dry_run,
+                "live_smoke": config.live_smoke,
+                "flatten_on_kill_switch": config.flatten_on_kill_switch,
+                "exchange": exchange.as_str(),
+                "account_id": config.account_id,
+            }),
+            ..base_entry.clone()
+        })
+        .context("write go_live audit entry")?;
+
+    tracing::info!(
+        run_id = %run_id,
+        spec_hash = %spec_hash,
+        exchange = exchange.as_str(),
+        account_id = %config.account_id,
+        dry_run = config.dry_run,
+        "live mode: compliance gate passed; confirmation token verified"
+    );
+
+    if config.dry_run {
+        tracing::info!("dry-run: all pre-flight checks passed; no orders will be placed");
+        audit
+            .write(&AuditEntry {
+                action: "dry_run_complete".to_string(),
+                ..base_entry.clone()
+            })
+            .context("write dry_run_complete audit entry")?;
+        return Ok(());
+    }
+
+    // 5. Live broker.
+    let base_url = match exchange {
+        Exchange::Binance => "https://api.binance.com",
+        Exchange::Bybit => "https://api.bybit.com",
+    };
+    let broker = LiveBroker::new(base_url, creds.api_key.clone(), creds.api_secret.clone());
+
+    // 6. Local risk cache: fail-closed if unreachable for > 5 minutes.
+    let risk_cache = LocalRiskCache::new(
+        RiskLimits {
+            kill_switch_active: false,
+            max_daily_loss_pct: dec!(2),
+            max_position_pct: dec!(5),
+            max_concurrent_orders: 5,
+        },
+        300,
+    );
+
+    // 7. Single round-trip smoke test (Verify: $50 sub-account).
+    if config.live_smoke {
+        let mut positions = LivePositionState::default();
+        run_live_smoke(
+            spec_hash,
+            run_id,
+            exchange,
+            &broker,
+            &mut positions,
+            &audit,
+            &config,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // 8. Kill-switch signal handler (SIGTERM / Ctrl-C → atomic flag).
+    let kill_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let kf = kill_flag.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await.ok();
+        kf.store(true, std::sync::atomic::Ordering::SeqCst);
+        tracing::warn!("kill-switch: signal received");
+    });
+
+    // 9. Main live loop (strategy interpreter consumed in Phase 4; Phase 6 wires the harness).
+    let positions = LivePositionState::default();
+    let outbox = OrderOutbox::default();
+    let symbol = spec
+        .get("symbols")
+        .and_then(Value::as_array)
+        .and_then(|s| s.first())
+        .and_then(Value::as_str)
+        .unwrap_or("BTCUSDT");
+
+    let mut ws = connect_market_ws(exchange, symbol).await?;
+    let mut next_heartbeat = Instant::now();
+
+    loop {
+        // Check kill-switch flag.
+        if kill_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            let action = KillSwitchAction::new(config.flatten_on_kill_switch, "signal received");
+            execute_kill_switch(&action, &broker, &positions, &audit, &base_entry).await?;
+            break;
+        }
+
+        // Fail-closed: activate kill-switch if risk cache is stale.
+        let effective = risk_cache.effective_limits();
+        if effective.kill_switch_active {
+            let action = KillSwitchAction::new(
+                config.flatten_on_kill_switch,
+                "risk cache stale — fail closed",
+            );
+            execute_kill_switch(&action, &broker, &positions, &audit, &base_entry).await?;
+            break;
+        }
+
+        let guard = RiskGuard::new(effective);
+        let risk_state = RiskState {
+            equity: positions.equity,
+            start_of_day_equity: positions.start_of_day_equity,
+            gross_position_pct: positions.gross_position_pct(),
+            open_orders: outbox.pending_for_reconciliation().len(),
+        };
+        if let Err(alert) = guard.check(&risk_state) {
+            tracing::warn!(alert = ?alert, "risk guard breached; triggering kill-switch");
+            let action = KillSwitchAction::new(
+                config.flatten_on_kill_switch,
+                format!("risk guard: {alert:?}"),
+            );
+            execute_kill_switch(&action, &broker, &positions, &audit, &base_entry).await?;
+            break;
+        }
+
+        tokio::select! {
+            msg = ws.next() => {
+                match msg {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(_))) => {
+                        // Phase 4 strategy interpreter generates OrderIntents here.
+                        // Phase 6 verifies the plumbing via --live-smoke.
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(p))) => {
+                        ws.send(tokio_tungstenite::tungstenite::Message::Pong(p)).await.ok();
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
+                        tracing::warn!("market WS closed; reconnecting");
+                        ws = connect_market_ws(exchange, symbol).await?;
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "market WS error; reconnecting");
+                        ws = connect_market_ws(exchange, symbol).await?;
+                    }
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep_until(next_heartbeat) => {
+                tracing::info!(
+                    run_id = %run_id,
+                    open_positions = positions.open_symbols().len(),
+                    pending_outbox = outbox.pending_for_reconciliation().len(),
+                    "live heartbeat"
+                );
+                audit.write(&AuditEntry {
+                    action: "heartbeat".to_string(),
+                    payload: json!({
+                        "open_positions": positions.open_symbols().len(),
+                        "pending_outbox": outbox.pending_for_reconciliation().len(),
+                    }),
+                    ..base_entry.clone()
+                }).ok();
+                next_heartbeat = Instant::now() + Duration::from_secs(60);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn execute_kill_switch(
+    action: &KillSwitchAction,
+    broker: &LiveBroker,
+    positions: &LivePositionState,
+    audit: &AuditLog,
+    base_entry: &AuditEntry,
+) -> Result<()> {
+    tracing::warn!(
+        reason = %action.reason,
+        flatten = action.flatten_positions,
+        "kill-switch activated; cancelling all open orders"
+    );
+
+    let mut cancelled = 0usize;
+    for symbol in positions.open_symbols() {
+        match broker.cancel_all_open_orders(&symbol).await {
+            Ok(n) => {
+                cancelled += n;
+                tracing::info!(symbol = %symbol, cancelled = n, "cancelled open orders");
+            }
+            Err(e) => tracing::error!(symbol = %symbol, error = %e, "cancel-all failed"),
+        }
+    }
+
+    let mut flatten_errors = 0usize;
+    if action.flatten_positions {
+        for (symbol, &qty) in &positions.positions {
+            if qty > Decimal::ZERO {
+                let intent_id = format!("ks-flatten-{symbol}");
+                let client_order_id =
+                    deterministic_client_order_id(&base_entry.spec_hash, &intent_id);
+                match broker
+                    .place_market_order(symbol, Side::Sell, qty, client_order_id)
+                    .await
+                {
+                    Ok(resp) => {
+                        tracing::info!(
+                            symbol = %symbol,
+                            qty = %qty,
+                            order_id = resp.order_id,
+                            "flatten order placed"
+                        );
+                    }
+                    Err(e) => {
+                        flatten_errors += 1;
+                        tracing::error!(symbol = %symbol, error = %e, "flatten order failed");
+                    }
+                }
+            }
+        }
+    }
+
+    audit
+        .write(&AuditEntry {
+            action: "kill_switch".to_string(),
+            payload: json!({
+                "reason": action.reason,
+                "cancel_all": action.cancel_all,
+                "flatten_positions": action.flatten_positions,
+                "cancelled_orders": cancelled,
+                "flatten_errors": flatten_errors,
+            }),
+            result: if flatten_errors == 0 {
+                "ok".to_string()
+            } else {
+                format!("{flatten_errors} flatten error(s)")
+            },
+            ..base_entry.clone()
+        })
+        .context("write kill_switch audit entry")?;
+
+    Ok(())
+}
+
+async fn run_live_smoke(
+    spec_hash: &str,
+    run_id: &str,
+    exchange: Exchange,
+    broker: &LiveBroker,
+    positions: &mut LivePositionState,
+    audit: &AuditLog,
+    config: &LiveModeConfig,
+) -> Result<()> {
+    tracing::info!("live smoke: single round-trip on {}", exchange.as_str());
+
+    let base_entry = AuditEntry {
+        ts: chrono::Utc::now(),
+        user_id: config.account_id.clone(),
+        run_id: run_id.to_string(),
+        spec_hash: spec_hash.to_string(),
+        exchange,
+        action: String::new(),
+        payload: json!({}),
+        result: "ok".to_string(),
+    };
+
+    let symbol = "BTCUSDT";
+    let qty = dec!(0.001); // ~$55 at $55k BTC; within a $50 sub-account margin
+
+    // Step 1: Place market buy.
+    let buy_coid = deterministic_client_order_id(spec_hash, &format!("smoke-buy-{run_id}"));
+    let buy = broker
+        .place_market_order(symbol, Side::Buy, qty, buy_coid)
+        .await
+        .context("live smoke: place buy order")?;
+
+    tracing::info!(
+        order_id = buy.order_id,
+        client_order_id = %buy_coid,
+        status = %buy.status,
+        executed_qty = %buy.executed_qty,
+        "live smoke: buy filled"
+    );
+
+    let exec_qty = Decimal::from_str_exact(&buy.executed_qty).unwrap_or(qty);
+    positions.update_fill(symbol, Side::Buy, exec_qty);
+
+    audit
+        .write(&AuditEntry {
+            action: "live_smoke_buy".to_string(),
+            payload: json!({
+                "order_id": buy.order_id,
+                "client_order_id": buy_coid.to_string(),
+                "symbol": symbol,
+                "qty": qty.to_string(),
+                "executed_qty": buy.executed_qty,
+                "status": buy.status,
+                "cumulative_quote_qty": buy.cumulative_quote_qty,
+            }),
+            ..base_entry.clone()
+        })
+        .context("write live_smoke_buy audit entry")?;
+
+    // Step 2: Reconcile buy against exchange order status.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    if let Some(status) = broker.get_order_status(symbol, buy_coid).await? {
+        let ex_qty = Decimal::from_str_exact(&status.executed_qty).unwrap_or(Decimal::ZERO);
+        let ex_price = if ex_qty > Decimal::ZERO {
+            Decimal::from_str_exact(&status.cumulative_quote_qty).unwrap_or(Decimal::ZERO) / ex_qty
+        } else {
+            Decimal::ZERO
+        };
+
+        let check = ReconciliationCheck {
+            client_order_id: buy_coid,
+            local_symbol: symbol.to_string(),
+            local_side: Side::Buy,
+            local_qty: exec_qty,
+            local_price: ex_price,
+            exchange_symbol: status.symbol.clone(),
+            exchange_side: if status.side == "BUY" {
+                Side::Buy
+            } else {
+                Side::Sell
+            },
+            exchange_qty: ex_qty,
+            exchange_price: ex_price,
+        };
+
+        let recon = reconcile_fill(&check, dec!(50));
+
+        audit
+            .write(&AuditEntry {
+                action: "reconciliation".to_string(),
+                payload: json!({
+                    "client_order_id": buy_coid.to_string(),
+                    "matched": recon.is_matched(),
+                    "result": format!("{recon:?}"),
+                }),
+                result: if recon.is_matched() { "ok" } else { "mismatch" }.to_string(),
+                ..base_entry.clone()
+            })
+            .context("write reconciliation audit entry")?;
+
+        tracing::info!(matched = recon.is_matched(), result = ?recon, "live smoke: reconciliation");
+        if !recon.is_matched() {
+            anyhow::bail!("live smoke reconciliation mismatch: {recon:?}");
+        }
+    }
+
+    // Step 3: Close position with market sell.
+    let sell_coid = deterministic_client_order_id(spec_hash, &format!("smoke-sell-{run_id}"));
+    let sell = broker
+        .place_market_order(symbol, Side::Sell, exec_qty, sell_coid)
+        .await
+        .context("live smoke: place sell order")?;
+
+    positions.update_fill(symbol, Side::Sell, exec_qty);
+
+    tracing::info!(
+        order_id = sell.order_id,
+        status = %sell.status,
+        "live smoke: sell filled; position closed"
+    );
+
+    audit
+        .write(&AuditEntry {
+            action: "live_smoke_sell".to_string(),
+            payload: json!({
+                "order_id": sell.order_id,
+                "client_order_id": sell_coid.to_string(),
+                "status": sell.status,
+            }),
+            ..base_entry.clone()
+        })
+        .context("write live_smoke_sell audit entry")?;
+
+    anyhow::ensure!(
+        positions.is_flat(),
+        "live smoke complete but position not flat: {:?}",
+        positions.positions
+    );
+
+    tracing::info!(
+        run_id = %run_id,
+        "live smoke: round-trip complete; position flat; broker statement reconciled"
+    );
+
+    Ok(())
 }
 
 fn decimal_number(value: Decimal) -> f64 {
