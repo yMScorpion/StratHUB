@@ -16,7 +16,7 @@ use exec_rs::{
     ValidationMetrics, WsReconnectThrottle,
 };
 use futures_util::{SinkExt, StreamExt};
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -118,6 +118,10 @@ struct Args {
     #[arg(long, env = "EXEC_KMS_SECRET_CIPHERTEXT_HEX")]
     kms_secret_ciphertext_hex: Option<String>,
 
+    /// Stored broker-key scopes from trusted metadata (comma-separated, e.g. "trade,read").
+    #[arg(long, env = "EXEC_BROKER_KEY_SCOPE", value_delimiter = ',')]
+    broker_key_scope: Vec<String>,
+
     /// Hold-to-confirm token: sha256(spec_hash:account_id:exchange). Must match exactly.
     #[arg(long, env = "EXEC_CONFIRM_TOKEN")]
     confirm_token: Option<String>,
@@ -137,6 +141,10 @@ struct Args {
     /// Run a single round-trip order for verification ($50 sub-account smoke test).
     #[arg(long, env = "EXEC_LIVE_SMOKE")]
     live_smoke: bool,
+
+    /// Quote-currency cap for live smoke buy notional.
+    #[arg(long, default_value = "45", env = "EXEC_LIVE_SMOKE_QUOTE_CAP")]
+    live_smoke_quote_cap: Decimal,
 
     /// User jurisdiction code (e.g. "US"). Passed from API layer after profile check.
     #[arg(long, env = "EXEC_JURISDICTION")]
@@ -271,7 +279,7 @@ async fn main() -> Result<()> {
             let creds = BrokerCredentials {
                 api_key,
                 api_secret,
-                scope: vec!["trade".to_string()],
+                scope: parse_broker_key_scope(&args.broker_key_scope)?,
             };
 
             let tos_accepted_at = args
@@ -318,6 +326,7 @@ async fn main() -> Result<()> {
                     audit_log_dir: args.audit_log_dir.clone(),
                     state_dir: args.state_dir.clone(),
                     live_smoke: args.live_smoke,
+                    live_smoke_quote_cap: args.live_smoke_quote_cap,
                     dry_run: args.dry_run,
                 },
             )
@@ -819,6 +828,22 @@ fn metrics_json(metrics: &ValidationMetrics) -> Value {
 
 // ---- Phase 6: Live Mode + Safeguards ----
 
+fn parse_broker_key_scope(raw_scopes: &[String]) -> Result<Vec<String>> {
+    let scopes: Vec<String> = raw_scopes
+        .iter()
+        .map(|scope| scope.trim().to_ascii_lowercase())
+        .filter(|scope| !scope.is_empty())
+        .collect();
+
+    if scopes.is_empty() {
+        anyhow::bail!(
+            "--broker-key-scope (EXEC_BROKER_KEY_SCOPE) is required in live mode; pass trusted stored broker-key metadata"
+        );
+    }
+
+    Ok(scopes)
+}
+
 #[derive(Debug, Clone)]
 struct LiveModeConfig {
     account_id: String,
@@ -829,6 +854,7 @@ struct LiveModeConfig {
     #[allow(dead_code)]
     state_dir: std::path::PathBuf,
     live_smoke: bool,
+    live_smoke_quote_cap: Decimal,
     dry_run: bool,
 }
 
@@ -843,6 +869,18 @@ struct ExchangeOrderResponse {
     #[serde(rename = "cummulativeQuoteQty")]
     cumulative_quote_qty: String,
     status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceErrorResponse {
+    code: i64,
+    #[allow(dead_code)]
+    msg: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceTickerPriceResponse {
+    price: String,
 }
 
 struct LiveBroker {
@@ -937,17 +975,40 @@ impl LiveBroker {
             .await
             .context("DELETE /api/v3/openOrders")?;
 
-        // 400 with code -2011 means no open orders — not an error
-        if resp.status().as_u16() == 400 {
-            return Ok(0);
-        }
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            // Binance uses HTTP 400 for many signed-request failures. Only the exact
+            // no-such-order code is safe to suppress during cancel-all.
+            if status.as_u16() == 400 && binance_error_code(&body) == Some(-2011) {
+                return Ok(0);
+            }
             anyhow::bail!("cancel-all failed ({}): {}", status, body);
         }
         let cancelled: Vec<Value> = resp.json().await.context("parse cancel-all response")?;
         Ok(cancelled.len())
+    }
+
+    async fn ticker_price(&self, symbol: &str) -> Result<Decimal> {
+        let url = format!("{}/api/v3/ticker/price?symbol={}", self.base_url, symbol);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("GET /api/v3/ticker/price")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("ticker price failed ({}): {}", status, body);
+        }
+
+        let payload = resp
+            .json::<BinanceTickerPriceResponse>()
+            .await
+            .context("parse ticker price")?;
+        Decimal::from_str_exact(&payload.price).context("parse ticker price decimal")
     }
 
     async fn get_order_status(
@@ -990,6 +1051,34 @@ impl LiveBroker {
                 .context("parse order status")?,
         ))
     }
+}
+
+fn binance_error_code(body: &str) -> Option<i64> {
+    serde_json::from_str::<BinanceErrorResponse>(body)
+        .ok()
+        .map(|err| err.code)
+}
+
+fn calculate_live_smoke_qty(quote_cap: Decimal, reference_price: Decimal) -> Result<Decimal> {
+    if quote_cap <= Decimal::ZERO {
+        anyhow::bail!("live smoke quote cap must be positive");
+    }
+    if reference_price <= Decimal::ZERO {
+        anyhow::bail!("live smoke reference price must be positive");
+    }
+
+    let qty = (quote_cap * dec!(0.95) / reference_price)
+        .round_dp_with_strategy(6, RoundingStrategy::ToZero);
+
+    if qty <= Decimal::ZERO {
+        anyhow::bail!(
+            "live smoke quote cap {} is too small for reference price {}",
+            quote_cap,
+            reference_price
+        );
+    }
+
+    Ok(qty)
 }
 
 async fn run_live_mode(
@@ -1056,6 +1145,7 @@ async fn run_live_mode(
             payload: json!({
                 "dry_run": config.dry_run,
                 "live_smoke": config.live_smoke,
+                "live_smoke_quote_cap": config.live_smoke_quote_cap.to_string(),
                 "flatten_on_kill_switch": config.flatten_on_kill_switch,
                 "exchange": exchange.as_str(),
                 "account_id": config.account_id,
@@ -1356,7 +1446,20 @@ async fn run_live_smoke(
     };
 
     let symbol = "BTCUSDT";
-    let qty = dec!(0.001); // ~$55 at $55k BTC; within a $50 sub-account margin
+    let reference_price = broker
+        .ticker_price(symbol)
+        .await
+        .context("live smoke: fetch reference price")?;
+    let qty = calculate_live_smoke_qty(config.live_smoke_quote_cap, reference_price)
+        .context("live smoke: calculate quote-capped quantity")?;
+
+    tracing::info!(
+        symbol,
+        quote_cap = %config.live_smoke_quote_cap,
+        reference_price = %reference_price,
+        qty = %qty,
+        "live smoke: calculated quote-capped buy quantity"
+    );
 
     // Step 1: Place market buy.
     let buy_coid = deterministic_client_order_id(spec_hash, &format!("smoke-buy-{run_id}"));
@@ -1395,49 +1498,52 @@ async fn run_live_smoke(
     // Step 2: Reconcile buy against exchange order status.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    if let Some(status) = broker.get_order_status(symbol, buy_coid).await? {
-        let ex_qty = Decimal::from_str_exact(&status.executed_qty).unwrap_or(Decimal::ZERO);
-        let ex_price = if ex_qty > Decimal::ZERO {
-            Decimal::from_str_exact(&status.cumulative_quote_qty).unwrap_or(Decimal::ZERO) / ex_qty
+    let status = broker
+        .get_order_status(symbol, buy_coid)
+        .await?
+        .with_context(|| format!("live smoke: broker status missing for buy order {buy_coid}"))?;
+    let ex_qty = Decimal::from_str_exact(&status.executed_qty).unwrap_or(Decimal::ZERO);
+    let ex_price = if ex_qty > Decimal::ZERO {
+        Decimal::from_str_exact(&status.cumulative_quote_qty).unwrap_or(Decimal::ZERO) / ex_qty
+    } else {
+        Decimal::ZERO
+    };
+
+    let check = ReconciliationCheck {
+        client_order_id: buy_coid,
+        local_symbol: symbol.to_string(),
+        local_side: Side::Buy,
+        local_qty: exec_qty,
+        local_price: ex_price,
+        exchange_symbol: status.symbol.clone(),
+        exchange_side: if status.side == "BUY" {
+            Side::Buy
         } else {
-            Decimal::ZERO
-        };
+            Side::Sell
+        },
+        exchange_qty: ex_qty,
+        exchange_price: ex_price,
+    };
 
-        let check = ReconciliationCheck {
-            client_order_id: buy_coid,
-            local_symbol: symbol.to_string(),
-            local_side: Side::Buy,
-            local_qty: exec_qty,
-            local_price: ex_price,
-            exchange_symbol: status.symbol.clone(),
-            exchange_side: if status.side == "BUY" {
-                Side::Buy
-            } else {
-                Side::Sell
-            },
-            exchange_qty: ex_qty,
-            exchange_price: ex_price,
-        };
+    let recon = reconcile_fill(&check, dec!(50));
 
-        let recon = reconcile_fill(&check, dec!(50));
+    audit
+        .write(&AuditEntry {
+            action: "reconciliation".to_string(),
+            payload: json!({
+                "client_order_id": buy_coid.to_string(),
+                "matched": recon.is_matched(),
+                "result": format!("{recon:?}"),
+                "broker_status": status.status,
+            }),
+            result: if recon.is_matched() { "ok" } else { "mismatch" }.to_string(),
+            ..base_entry.clone()
+        })
+        .context("write reconciliation audit entry")?;
 
-        audit
-            .write(&AuditEntry {
-                action: "reconciliation".to_string(),
-                payload: json!({
-                    "client_order_id": buy_coid.to_string(),
-                    "matched": recon.is_matched(),
-                    "result": format!("{recon:?}"),
-                }),
-                result: if recon.is_matched() { "ok" } else { "mismatch" }.to_string(),
-                ..base_entry.clone()
-            })
-            .context("write reconciliation audit entry")?;
-
-        tracing::info!(matched = recon.is_matched(), result = ?recon, "live smoke: reconciliation");
-        if !recon.is_matched() {
-            anyhow::bail!("live smoke reconciliation mismatch: {recon:?}");
-        }
+    tracing::info!(matched = recon.is_matched(), result = ?recon, "live smoke: reconciliation");
+    if !recon.is_matched() {
+        anyhow::bail!("live smoke reconciliation mismatch: {recon:?}");
     }
 
     // Step 3: Close position with market sell.
@@ -1521,5 +1627,38 @@ mod tests {
             Some((Side::Buy, dec!(3)))
         );
         assert_eq!(flatten_order_for_position(Decimal::ZERO), None);
+    }
+
+    #[test]
+    fn binance_cancel_all_suppresses_only_no_such_order_code() {
+        assert_eq!(
+            binance_error_code(r#"{"code":-2011,"msg":"Unknown order sent."}"#),
+            Some(-2011)
+        );
+        assert_ne!(
+            binance_error_code(
+                r#"{"code":-1022,"msg":"Signature for this request is not valid."}"#
+            ),
+            Some(-2011)
+        );
+        assert_eq!(binance_error_code("not-json"), None);
+    }
+
+    #[test]
+    fn broker_key_scope_is_required_from_metadata() {
+        assert!(parse_broker_key_scope(&[]).is_err());
+        assert_eq!(
+            parse_broker_key_scope(&[" Trade ".to_string(), "read".to_string()]).unwrap(),
+            vec!["trade".to_string(), "read".to_string()]
+        );
+    }
+
+    #[test]
+    fn live_smoke_quantity_uses_quote_cap_with_buffer() {
+        let qty = calculate_live_smoke_qty(dec!(45), dec!(55000)).unwrap();
+        assert_eq!(qty, dec!(0.000777));
+        assert!(qty * dec!(55000) < dec!(45));
+        assert!(calculate_live_smoke_qty(dec!(0), dec!(55000)).is_err());
+        assert!(calculate_live_smoke_qty(dec!(45), dec!(0)).is_err());
     }
 }
