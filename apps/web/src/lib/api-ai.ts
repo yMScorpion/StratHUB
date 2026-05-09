@@ -4,6 +4,7 @@
  */
 
 const API_AI_BASE = process.env.API_AI_BASE_URL ?? "http://localhost:8000";
+const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY ?? "replace-me";
 
 export async function apiAiRequest(
   path: string,
@@ -15,6 +16,7 @@ export async function apiAiRequest(
     headers: {
       "Content-Type": "application/json",
       "X-User-Id": userId,
+      "X-Internal-Token": INTERNAL_API_KEY,
       ...(init?.headers as Record<string, string> | undefined),
     },
   });

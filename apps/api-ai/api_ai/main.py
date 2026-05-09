@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
-from pydantic import BaseModel
 
 from strategy_spec import (
     SchemaValidationError,
@@ -16,8 +15,10 @@ from strategy_spec import (
     with_hash,
 )
 
+from .routes.events import router as events_router
 from .routes.jobs import router as jobs_router
-from .settings import Settings, load_settings
+from .routes.validations import router as validations_router
+from .settings import load_settings
 
 
 def _require_internal(
@@ -53,6 +54,8 @@ def create_app() -> FastAPI:
     )
     app.state.settings = settings
     app.include_router(jobs_router, dependencies=[Depends(_require_internal)])
+    app.include_router(events_router, dependencies=[Depends(_require_internal)])
+    app.include_router(validations_router, dependencies=[Depends(_require_internal)])
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -68,6 +71,8 @@ def create_app() -> FastAPI:
                 "openrouter_model_fallback": settings.openrouter_model_fallback,
                 "embedding_model": settings.embedding_model,
                 "byok_mode": settings.byok_mode,
+                "max_concurrent_validators": settings.max_concurrent_validators,
+                "max_validation_event_batch": settings.max_validation_event_batch,
             },
         }
 
