@@ -1084,10 +1084,16 @@ async fn run_live_mode(
         return Ok(());
     }
 
+    if matches!(exchange, Exchange::Bybit) {
+        anyhow::bail!(
+            "live execution for bybit is not implemented yet; use --exchange binance for live mode"
+        );
+    }
+
     // 5. Live broker.
     let base_url = match exchange {
         Exchange::Binance => "https://api.binance.com",
-        Exchange::Bybit => "https://api.bybit.com",
+        Exchange::Bybit => unreachable!("bybit live mode is rejected before broker construction"),
     };
     let broker = LiveBroker::new(base_url, creds.api_key.clone(), creds.api_secret.clone());
 
@@ -1154,7 +1160,7 @@ async fn run_live_mode(
         // Check kill-switch flag.
         if kill_flag.load(std::sync::atomic::Ordering::SeqCst) {
             let action = KillSwitchAction::new(config.flatten_on_kill_switch, "signal received");
-            execute_kill_switch(&action, &broker, &positions, &audit, &base_entry).await?;
+            execute_kill_switch(&action, &broker, &positions, &outbox, &audit, &base_entry).await?;
             break;
         }
 
@@ -1165,7 +1171,7 @@ async fn run_live_mode(
                 config.flatten_on_kill_switch,
                 "risk cache stale — fail closed",
             );
-            execute_kill_switch(&action, &broker, &positions, &audit, &base_entry).await?;
+            execute_kill_switch(&action, &broker, &positions, &outbox, &audit, &base_entry).await?;
             break;
         }
 
@@ -1182,7 +1188,7 @@ async fn run_live_mode(
                 config.flatten_on_kill_switch,
                 format!("risk guard: {alert:?}"),
             );
-            execute_kill_switch(&action, &broker, &positions, &audit, &base_entry).await?;
+            execute_kill_switch(&action, &broker, &positions, &outbox, &audit, &base_entry).await?;
             break;
         }
 
@@ -1234,6 +1240,7 @@ async fn execute_kill_switch(
     action: &KillSwitchAction,
     broker: &LiveBroker,
     positions: &LivePositionState,
+    outbox: &OrderOutbox,
     audit: &AuditLog,
     base_entry: &AuditEntry,
 ) -> Result<()> {
@@ -1244,7 +1251,7 @@ async fn execute_kill_switch(
     );
 
     let mut cancelled = 0usize;
-    for symbol in positions.open_symbols() {
+    for symbol in kill_switch_cancel_symbols(positions, outbox) {
         match broker.cancel_all_open_orders(&symbol).await {
             Ok(n) => {
                 cancelled += n;
@@ -1257,18 +1264,19 @@ async fn execute_kill_switch(
     let mut flatten_errors = 0usize;
     if action.flatten_positions {
         for (symbol, &qty) in &positions.positions {
-            if qty > Decimal::ZERO {
+            if let Some((side, flatten_qty)) = flatten_order_for_position(qty) {
                 let intent_id = format!("ks-flatten-{symbol}");
                 let client_order_id =
                     deterministic_client_order_id(&base_entry.spec_hash, &intent_id);
                 match broker
-                    .place_market_order(symbol, Side::Sell, qty, client_order_id)
+                    .place_market_order(symbol, side, flatten_qty, client_order_id)
                     .await
                 {
                     Ok(resp) => {
                         tracing::info!(
                             symbol = %symbol,
-                            qty = %qty,
+                            side = side.as_str(),
+                            qty = %flatten_qty,
                             order_id = resp.order_id,
                             "flatten order placed"
                         );
@@ -1302,6 +1310,27 @@ async fn execute_kill_switch(
         .context("write kill_switch audit entry")?;
 
     Ok(())
+}
+
+fn kill_switch_cancel_symbols(
+    positions: &LivePositionState,
+    outbox: &OrderOutbox,
+) -> std::collections::BTreeSet<String> {
+    positions
+        .open_symbols()
+        .into_iter()
+        .chain(outbox.open_order_symbols())
+        .collect()
+}
+
+fn flatten_order_for_position(qty: Decimal) -> Option<(Side, Decimal)> {
+    if qty > Decimal::ZERO {
+        Some((Side::Sell, qty))
+    } else if qty < Decimal::ZERO {
+        Some((Side::Buy, qty.abs()))
+    } else {
+        None
+    }
 }
 
 async fn run_live_smoke(
@@ -1454,4 +1483,43 @@ async fn run_live_smoke(
 
 fn decimal_number(value: Decimal) -> f64 {
     value.to_string().parse::<f64>().unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_switch_cancel_symbols_include_outbox_only_symbols() {
+        let mut positions = LivePositionState::default();
+        positions.update_fill("ETHUSDT", Side::Buy, dec!(0.5));
+
+        let mut outbox = OrderOutbox::default();
+        outbox.enqueue(
+            &"f".repeat(64),
+            OrderIntent {
+                intent_id: "entry-btc".to_string(),
+                symbol: "BTCUSDT".to_string(),
+                side: Side::Buy,
+                qty: dec!(0.01),
+            },
+        );
+
+        let symbols = kill_switch_cancel_symbols(&positions, &outbox);
+        assert!(symbols.contains("BTCUSDT"));
+        assert!(symbols.contains("ETHUSDT"));
+    }
+
+    #[test]
+    fn flatten_order_buys_abs_quantity_for_short_positions() {
+        assert_eq!(
+            flatten_order_for_position(dec!(2)),
+            Some((Side::Sell, dec!(2)))
+        );
+        assert_eq!(
+            flatten_order_for_position(dec!(-3)),
+            Some((Side::Buy, dec!(3)))
+        );
+        assert_eq!(flatten_order_for_position(Decimal::ZERO), None);
+    }
 }

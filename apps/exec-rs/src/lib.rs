@@ -310,6 +310,16 @@ impl OrderOutbox {
             .map(|order| order.client_order_id)
             .collect()
     }
+
+    pub fn open_order_symbols(&self) -> Vec<String> {
+        self.orders
+            .values()
+            .filter(|order| matches!(order.status, OutboxStatus::Pending | OutboxStatus::Acked))
+            .map(|order| order.intent.symbol.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -945,8 +955,10 @@ mod tests {
         let second = outbox.enqueue(&"f".repeat(64), intent);
         assert_eq!(first, second);
         assert_eq!(outbox.pending_for_reconciliation(), vec![first]);
+        assert_eq!(outbox.open_order_symbols(), vec!["BTCUSDT".to_string()]);
         assert!(outbox.mark(first, OutboxStatus::Filled));
         assert!(outbox.pending_for_reconciliation().is_empty());
+        assert!(outbox.open_order_symbols().is_empty());
     }
 
     #[test]
