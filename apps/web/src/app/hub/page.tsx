@@ -23,82 +23,98 @@ export default async function HubPage() {
     strategies = data ?? [];
   }
 
-  const statusColor: Record<string, string> = {
-    needs_review: "#f59e0b",
-    approved: "#22c55e",
-    rejected: "#ef4444",
+  const statusClass: Record<string, string> = {
+    needs_review: "status-review",
+    approved: "status-approved",
+    rejected: "status-rejected",
   };
 
   return (
-    <main style={{ padding: "2rem 4rem", maxWidth: 900 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: "2rem", marginBottom: "2rem" }}>
-        <h1 style={{ fontWeight: 600, fontSize: "1.75rem" }}>Strategy Hub</h1>
-        <Link
-          href="/hub/new"
-          style={{
-            background: "#2563eb",
-            color: "#fff",
-            padding: "0.5rem 1.2rem",
-            borderRadius: 6,
-            textDecoration: "none",
-            fontSize: "0.9rem",
-          }}
-        >
+    <main className="fade-in">
+      <nav aria-label="Primary" className="topbar">
+        <Link className="brand" href="/">
+          <span className="brand-mark" aria-hidden="true">S</span>
+          <span>StratHUB</span>
+        </Link>
+        <div className="topnav">
+          <Link className="nav-link" href="/hub">Hub</Link>
+          <Link className="nav-link" href="/hub/new">Upload</Link>
+          <Link className="nav-link" href="/login">Sign in</Link>
+        </div>
+      </nav>
+
+      <header className="page-header">
+        <div>
+          <p className="eyebrow">Review queue</p>
+          <h1 className="section-title">Strategy Hub</h1>
+          <p className="subtle">
+            Track compiled strategies from ingestion through the approval gate.
+          </p>
+        </div>
+        <Link className="button" href="/hub/new">
           + New strategy
         </Link>
-      </div>
+      </header>
 
       {strategies.length === 0 ? (
-        <p style={{ opacity: 0.6 }}>
-          No strategies yet.{" "}
-          <Link href="/hub/new" style={{ color: "#2563eb" }}>
-            Upload a PDF to get started.
-          </Link>
-        </p>
+        <section className="panel empty-state" aria-labelledby="empty-hub-title">
+          <div className="empty-state-inner">
+            <div className="empty-icon" aria-hidden="true">+</div>
+            <h2 className="section-title" id="empty-hub-title">No strategies yet</h2>
+            <p className="subtle">
+              Upload a methodology PDF to create the first ingestion job and begin the review flow.
+            </p>
+            <div className="actions actions-center">
+              <Link className="button" href="/hub/new">Upload PDFs</Link>
+            </div>
+          </div>
+        </section>
       ) : (
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead>
-            <tr style={{ borderBottom: "1px solid #e5e7eb", textAlign: "left" }}>
-              <th style={{ padding: "0.5rem 0.75rem" }}>Spec hash</th>
-              <th style={{ padding: "0.5rem 0.75rem" }}>Status</th>
-              <th style={{ padding: "0.5rem 0.75rem" }}>Created</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {strategies.map((s) => (
-              <tr key={s.id} style={{ borderBottom: "1px solid #f3f4f6" }}>
-                <td style={{ padding: "0.6rem 0.75rem", fontFamily: "monospace", fontSize: "0.8rem" }}>
-                  {s.spec_hash.slice(0, 12)}…
-                </td>
-                <td style={{ padding: "0.6rem 0.75rem" }}>
-                  <span
-                    style={{
-                      background: statusColor[s.status] ?? "#9ca3af",
-                      color: "#fff",
-                      borderRadius: 4,
-                      padding: "0.15rem 0.5rem",
-                      fontSize: "0.75rem",
-                    }}
-                  >
-                    {s.status}
-                  </span>
-                </td>
-                <td style={{ padding: "0.6rem 0.75rem", fontSize: "0.85rem", opacity: 0.7 }}>
-                  {new Date(s.created_at).toLocaleDateString()}
-                </td>
-                <td style={{ padding: "0.6rem 0.75rem" }}>
-                  <Link href={`/strategies/${s.id}/review`} style={{ color: "#2563eb", fontSize: "0.85rem", marginRight: "0.8rem" }}>
-                    Review
-                  </Link>
-                  <Link href={`/strategies/${s.id}/validate`} style={{ color: "#2563eb", fontSize: "0.85rem" }}>
-                    Validate →
-                  </Link>
-                </td>
+        <section className="panel table-wrap" aria-label="Strategies">
+          <table className="data-table">
+            <thead>
+              <tr>
+                <th scope="col">Spec hash</th>
+                <th scope="col">Status</th>
+                <th scope="col">Created</th>
+                <th scope="col">
+                  <span className="subtle">Actions</span>
+                </th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {strategies.map((s) => (
+                <tr key={s.id}>
+                  <td>
+                    <code className="mono">{s.spec_hash.slice(0, 12)}...</code>
+                  </td>
+                  <td>
+                    <span className={`status-pill ${statusClass[s.status] ?? "status-neutral"}`}>
+                      {s.status.replaceAll("_", " ")}
+                    </span>
+                  </td>
+                  <td className="subtle">
+                    {new Intl.DateTimeFormat("en", {
+                      month: "short",
+                      day: "numeric",
+                      year: "numeric",
+                    }).format(new Date(s.created_at))}
+                  </td>
+                  <td>
+                    <div className="actions">
+                      <Link className="button button-secondary" href={`/strategies/${s.id}/review`}>
+                        Review
+                      </Link>
+                      <Link className="button button-secondary" href={`/strategies/${s.id}/validate`}>
+                        Validate
+                      </Link>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </section>
       )}
     </main>
   );
