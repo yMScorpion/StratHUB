@@ -679,22 +679,46 @@ pub fn check_compliance_gate(record: &ComplianceRecord) -> Result<(), Compliance
     Ok(())
 }
 
-// Hold-to-confirm: token = sha256(spec_hash:account_id:exchange).
-// Pre-computed by the API layer and passed as EXEC_CONFIRM_TOKEN. Binding the
-// token to spec_hash + account_id + exchange means any parameter change invalidates it.
+// Hold-to-confirm: the API layer mints a high-entropy token, records only its
+// SHA-256 digest, and passes the user-provided token plus recorded digest to the
+// executor. The executor must not derive or disclose a usable token from public
+// session fields.
 
 pub struct ConfirmationGate;
 
 impl ConfirmationGate {
-    pub fn expected_token(spec_hash: &str, account_id: &str, exchange: Exchange) -> String {
+    pub fn token_digest(token: &str) -> String {
         use sha2::{Digest, Sha256};
-        let input = format!("{spec_hash}:{account_id}:{}", exchange.as_str());
-        hex::encode(Sha256::digest(input.as_bytes()))
+        hex::encode(Sha256::digest(token.as_bytes()))
     }
 
-    pub fn verify(provided: &str, spec_hash: &str, account_id: &str, exchange: Exchange) -> bool {
-        provided == Self::expected_token(spec_hash, account_id, exchange)
+    pub fn verify(provided: &str, expected_digest_hex: &str) -> bool {
+        let Ok(expected_digest) = hex::decode(expected_digest_hex) else {
+            return false;
+        };
+        if expected_digest.len() != 32 {
+            return false;
+        }
+
+        let provided_digest = Self::token_digest(provided);
+        let Ok(provided_digest) = hex::decode(provided_digest) else {
+            return false;
+        };
+
+        constant_time_eq(&provided_digest, &expected_digest)
     }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let diff = left
+        .iter()
+        .zip(right.iter())
+        .fold(0u8, |diff, (left, right)| diff | (*left ^ *right));
+    diff == 0
 }
 
 // Append-only audit log: one JSONL entry per live action.
@@ -1135,38 +1159,20 @@ mod tests {
     }
 
     #[test]
-    fn confirmation_gate_binds_to_spec_hash_account_and_exchange() {
-        let spec_hash = "a".repeat(64);
-        let account_id = "sub-account-50usd";
+    fn confirmation_gate_verifies_server_recorded_digest() {
+        let token = "server-minted-live-confirmation-token";
+        let digest = ConfirmationGate::token_digest(token);
 
-        let token = ConfirmationGate::expected_token(&spec_hash, account_id, Exchange::Binance);
-        assert!(ConfirmationGate::verify(
-            &token,
-            &spec_hash,
-            account_id,
-            Exchange::Binance
-        ));
+        assert!(ConfirmationGate::verify(token, &digest));
 
         // Wrong token
+        assert!(!ConfirmationGate::verify("wrong", &digest));
+        // Malformed recorded digest
+        assert!(!ConfirmationGate::verify(token, "not-a-hex-digest"));
+        // Correct token cannot pass against a different recorded digest
         assert!(!ConfirmationGate::verify(
-            "wrong",
-            &spec_hash,
-            account_id,
-            Exchange::Binance
-        ));
-        // Different spec_hash
-        assert!(!ConfirmationGate::verify(
-            &token,
-            &"b".repeat(64),
-            account_id,
-            Exchange::Binance
-        ));
-        // Different exchange
-        assert!(!ConfirmationGate::verify(
-            &token,
-            &spec_hash,
-            account_id,
-            Exchange::Bybit
+            token,
+            &ConfirmationGate::token_digest("another-token")
         ));
     }
 

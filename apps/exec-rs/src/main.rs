@@ -122,9 +122,13 @@ struct Args {
     #[arg(long, env = "EXEC_BROKER_KEY_SCOPE", value_delimiter = ',')]
     broker_key_scope: Vec<String>,
 
-    /// Hold-to-confirm token: sha256(spec_hash:account_id:exchange). Must match exactly.
+    /// Hold-to-confirm token supplied by the user for this live session.
     #[arg(long, env = "EXEC_CONFIRM_TOKEN")]
     confirm_token: Option<String>,
+
+    /// Server-recorded SHA-256 digest of the hold-to-confirm token.
+    #[arg(long, env = "EXEC_CONFIRM_TOKEN_DIGEST")]
+    confirm_token_digest: Option<String>,
 
     /// Flatten all open positions (market sell) when kill-switch fires.
     #[arg(long, env = "EXEC_FLATTEN_ON_KILL_SWITCH")]
@@ -311,6 +315,9 @@ async fn main() -> Result<()> {
                 .confirm_token
                 .clone()
                 .context("--confirm-token (EXEC_CONFIRM_TOKEN) is required in live mode")?;
+            let confirm_token_digest = args.confirm_token_digest.clone().context(
+                "--confirm-token-digest (EXEC_CONFIRM_TOKEN_DIGEST) is required in live mode",
+            )?;
 
             run_live_mode(
                 &spec,
@@ -321,6 +328,7 @@ async fn main() -> Result<()> {
                 LiveModeConfig {
                     account_id,
                     confirm_token,
+                    confirm_token_digest,
                     compliance,
                     flatten_on_kill_switch: args.flatten_on_kill_switch,
                     audit_log_dir: args.audit_log_dir.clone(),
@@ -848,6 +856,7 @@ fn parse_broker_key_scope(raw_scopes: &[String]) -> Result<Vec<String>> {
 struct LiveModeConfig {
     account_id: String,
     confirm_token: String,
+    confirm_token_digest: String,
     compliance: ComplianceRecord,
     flatten_on_kill_switch: bool,
     audit_log_dir: std::path::PathBuf,
@@ -1280,17 +1289,11 @@ async fn run_live_mode(
         }
     })?;
 
-    // 3. Hold-to-confirm: token binds this session to spec_hash + account_id + exchange.
-    if !ConfirmationGate::verify(
-        &config.confirm_token,
-        spec_hash,
-        &config.account_id,
-        exchange,
-    ) {
-        let expected = ConfirmationGate::expected_token(spec_hash, &config.account_id, exchange);
+    // 3. Hold-to-confirm: verify against the server-recorded confirmation digest.
+    if !ConfirmationGate::verify(&config.confirm_token, &config.confirm_token_digest) {
         anyhow::bail!(
-            "confirmation token mismatch — re-run with:\n  EXEC_CONFIRM_TOKEN={expected}\n\
-             (token is bound to spec_hash={spec_hash}, account_id={}, exchange={})",
+            "confirmation token mismatch for live session \
+             (spec_hash={spec_hash}, account_id={}, exchange={}); request a new confirmation token",
             config.account_id,
             exchange.as_str()
         );

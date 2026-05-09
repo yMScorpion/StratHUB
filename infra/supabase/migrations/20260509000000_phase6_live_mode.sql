@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS live_runs (
   account_id            uuid        NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
   status                text        NOT NULL DEFAULT 'running'
     CHECK (status IN ('running','stopped','error')),
-  confirmation_token    text        NOT NULL,
+  confirmation_token_digest text    NOT NULL CHECK (confirmation_token_digest ~ '^[0-9a-f]{64}$'),
   flatten_on_kill       boolean     NOT NULL DEFAULT false,
   kill_switch_fired_at  timestamptz,
   kill_switch_reason    text,
@@ -76,14 +76,7 @@ CREATE POLICY "live_runs readable by owner"
   ON live_runs FOR SELECT TO authenticated
   USING (user_id = auth.uid());
 
-CREATE POLICY "live_runs insertable by owner"
-  ON live_runs FOR INSERT TO authenticated
-  WITH CHECK (user_id = auth.uid());
-
-CREATE POLICY "live_runs updatable by owner"
-  ON live_runs FOR UPDATE TO authenticated
-  USING (user_id = auth.uid())
-  WITH CHECK (user_id = auth.uid());
+-- No authenticated INSERT/UPDATE/DELETE policies: live_runs are executor/service-role written.
 
 -- positions: current signed-quantity per symbol for an active live run.
 -- Upserted on each fill; removed when qty reaches zero.
