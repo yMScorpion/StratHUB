@@ -4,6 +4,10 @@
 //! for adapter smoke tests, not strategy validation.
 
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
@@ -1226,6 +1230,34 @@ fn binance_error_code(body: &str) -> Option<i64> {
         .map(|err| err.code)
 }
 
+fn install_kill_switch_signal_handler() -> Arc<AtomicBool> {
+    let kill_flag = Arc::new(AtomicBool::new(false));
+    let kf = kill_flag.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await.ok();
+        kf.store(true, Ordering::SeqCst);
+        tracing::warn!("kill-switch: signal received");
+    });
+    kill_flag
+}
+
+fn check_live_smoke_kill_switch(kill_flag: &AtomicBool) -> Result<()> {
+    if kill_flag.load(Ordering::SeqCst) {
+        anyhow::bail!("live smoke interrupted by kill-switch signal");
+    }
+    Ok(())
+}
+
 fn floor_to_step(value: Decimal, step_size: Decimal) -> Result<Decimal> {
     if step_size <= Decimal::ZERO {
         anyhow::bail!("step size must be positive");
@@ -1371,14 +1403,17 @@ async fn run_live_mode(
         return Ok(());
     }
 
-    // 5. Live broker.
+    // 5. Kill-switch signal handler (SIGTERM / Ctrl-C -> atomic flag).
+    let kill_flag = install_kill_switch_signal_handler();
+
+    // 6. Live broker.
     let base_url = match exchange {
         Exchange::Binance => "https://api.binance.com",
         Exchange::Bybit => unreachable!("bybit live mode is rejected before broker construction"),
     };
     let broker = LiveBroker::new(base_url, creds.api_key.clone(), creds.api_secret.clone());
 
-    // 6. Local risk cache: fail-closed if unreachable for > 5 minutes.
+    // 7. Local risk cache: fail-closed if unreachable for > 5 minutes.
     let risk_cache = LocalRiskCache::new(
         RiskLimits {
             kill_switch_active: false,
@@ -1389,19 +1424,36 @@ async fn run_live_mode(
         300,
     );
 
-    // 7. Single round-trip smoke test (Verify: $50 sub-account).
+    // 8. Single round-trip smoke test (Verify: $50 sub-account).
     if config.live_smoke {
         let mut positions = LivePositionState::default();
-        run_live_smoke(
-            spec_hash,
-            run_id,
-            exchange,
+        let smoke_result = run_live_smoke(
+            &base_entry,
             &broker,
             &mut positions,
             &audit,
             &config,
+            &kill_flag,
         )
-        .await?;
+        .await;
+        if let Err(err) = smoke_result {
+            if !positions.is_flat() {
+                let action = KillSwitchAction::new(
+                    config.flatten_on_kill_switch,
+                    format!("live smoke aborted before flattening: {err}"),
+                );
+                execute_kill_switch(
+                    &action,
+                    &broker,
+                    &positions,
+                    &OrderOutbox::default(),
+                    &audit,
+                    &base_entry,
+                )
+                .await?;
+            }
+            return Err(err);
+        }
         return Ok(());
     }
 
@@ -1422,25 +1474,6 @@ async fn run_live_mode(
         );
     }
 
-    // 8. Kill-switch signal handler (SIGTERM / Ctrl-C → atomic flag).
-    let kill_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let kf = kill_flag.clone();
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = sigterm.recv() => {},
-            }
-        }
-        #[cfg(not(unix))]
-        tokio::signal::ctrl_c().await.ok();
-        kf.store(true, std::sync::atomic::Ordering::SeqCst);
-        tracing::warn!("kill-switch: signal received");
-    });
-
     // 9. Main live loop (strategy interpreter consumed in Phase 4; Phase 6 wires the harness).
     let positions = LivePositionState::default();
     let outbox = OrderOutbox::default();
@@ -1456,7 +1489,7 @@ async fn run_live_mode(
 
     loop {
         // Check kill-switch flag.
-        if kill_flag.load(std::sync::atomic::Ordering::SeqCst) {
+        if kill_flag.load(Ordering::SeqCst) {
             let action = KillSwitchAction::new(config.flatten_on_kill_switch, "signal received");
             execute_kill_switch(&action, &broker, &positions, &outbox, &audit, &base_entry).await?;
             break;
@@ -1633,26 +1666,17 @@ fn flatten_order_for_position(qty: Decimal) -> Option<(Side, Decimal)> {
 }
 
 async fn run_live_smoke(
-    spec_hash: &str,
-    run_id: &str,
-    exchange: Exchange,
+    base_entry: &AuditEntry,
     broker: &LiveBroker,
     positions: &mut LivePositionState,
     audit: &AuditLog,
     config: &LiveModeConfig,
+    kill_flag: &AtomicBool,
 ) -> Result<()> {
-    tracing::info!("live smoke: single round-trip on {}", exchange.as_str());
-
-    let base_entry = AuditEntry {
-        ts: chrono::Utc::now(),
-        user_id: config.user_id.clone(),
-        run_id: run_id.to_string(),
-        spec_hash: spec_hash.to_string(),
-        exchange,
-        action: String::new(),
-        payload: json!({}),
-        result: "ok".to_string(),
-    };
+    tracing::info!(
+        "live smoke: single round-trip on {}",
+        base_entry.exchange.as_str()
+    );
 
     let symbol = "BTCUSDT";
     let reference_price = broker
@@ -1679,7 +1703,11 @@ async fn run_live_smoke(
     );
 
     // Step 1: Place market buy.
-    let buy_coid = deterministic_client_order_id(spec_hash, &format!("smoke-buy-{run_id}"));
+    check_live_smoke_kill_switch(kill_flag)?;
+    let buy_coid = deterministic_client_order_id(
+        &base_entry.spec_hash,
+        &format!("smoke-buy-{}", base_entry.run_id),
+    );
     let buy = broker
         .place_market_order(symbol, Side::Buy, qty, buy_coid)
         .await
@@ -1711,9 +1739,11 @@ async fn run_live_smoke(
             ..base_entry.clone()
         })
         .context("write live_smoke_buy audit entry")?;
+    check_live_smoke_kill_switch(kill_flag)?;
 
     // Step 2: Reconcile buy against exchange order status.
     tokio::time::sleep(Duration::from_secs(2)).await;
+    check_live_smoke_kill_switch(kill_flag)?;
 
     let status = broker
         .get_order_status(symbol, buy_coid)
@@ -1762,6 +1792,7 @@ async fn run_live_smoke(
     if !recon.is_matched() {
         anyhow::bail!("live smoke reconciliation mismatch: {recon:?}");
     }
+    check_live_smoke_kill_switch(kill_flag)?;
 
     // Step 3: Close position with a sellable free balance, accounting for base-asset fees.
     let post_buy_free_base = broker
@@ -1799,7 +1830,11 @@ async fn run_live_smoke(
         positions.update_fill(symbol, Side::Sell, exec_qty - sell_qty);
     }
 
-    let sell_coid = deterministic_client_order_id(spec_hash, &format!("smoke-sell-{run_id}"));
+    let sell_coid = deterministic_client_order_id(
+        &base_entry.spec_hash,
+        &format!("smoke-sell-{}", base_entry.run_id),
+    );
+    check_live_smoke_kill_switch(kill_flag)?;
     let sell = broker
         .place_market_order(symbol, Side::Sell, sell_qty, sell_coid)
         .await
@@ -1868,7 +1903,7 @@ async fn run_live_smoke(
     );
 
     tracing::info!(
-        run_id = %run_id,
+        run_id = %base_entry.run_id,
         "live smoke: round-trip complete; position flat; broker statement reconciled"
     );
 

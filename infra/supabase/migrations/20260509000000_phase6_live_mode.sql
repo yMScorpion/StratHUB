@@ -1,5 +1,7 @@
 -- Phase 6: live mode tables.
 -- Adds accounts, live_runs, positions, trades, fills, and audit_log.
+-- Phase 6 live execution is limited to Binance until per-exchange signed
+-- order/cancel-all/flatten adapters are implemented for additional venues.
 -- All tables follow the same RLS conventions as earlier phases:
 --   owner reads use user_id = auth.uid(); executor-owned records are written only by service role.
 
@@ -27,7 +29,7 @@ $$;
 CREATE TABLE IF NOT EXISTS accounts (
   id                  uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id             uuid        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  exchange            text        NOT NULL CHECK (exchange IN ('binance','bybit')),
+  exchange            text        NOT NULL CHECK (exchange = 'binance'),
   label               text        NOT NULL,
   broker_account_ref  text        NOT NULL,
   api_key_id          uuid        REFERENCES api_keys(id) ON DELETE SET NULL,
@@ -72,7 +74,7 @@ CREATE TABLE IF NOT EXISTS live_runs (
   user_id               uuid        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   strategy_id           uuid        NOT NULL REFERENCES strategies(id) ON DELETE CASCADE,
   spec_hash             text        NOT NULL CHECK (spec_hash ~ '^[0-9a-f]{64}$'),
-  exchange              text        NOT NULL CHECK (exchange IN ('binance','bybit')),
+  exchange              text        NOT NULL CHECK (exchange = 'binance'),
   account_id            uuid        NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
   status                text        NOT NULL DEFAULT 'running'
     CHECK (status IN ('running','stopped','error')),
@@ -111,7 +113,7 @@ CREATE TABLE IF NOT EXISTS positions (
   id          uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id     uuid        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   live_run_id uuid        NOT NULL REFERENCES live_runs(id) ON DELETE CASCADE,
-  exchange    text        NOT NULL CHECK (exchange IN ('binance','bybit')),
+  exchange    text        NOT NULL CHECK (exchange = 'binance'),
   symbol      text        NOT NULL,
   qty         numeric     NOT NULL,
   updated_at  timestamptz NOT NULL DEFAULT now(),
@@ -134,7 +136,7 @@ CREATE TABLE IF NOT EXISTS trades (
   user_id           uuid        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   live_run_id       uuid        NOT NULL REFERENCES live_runs(id) ON DELETE CASCADE,
   strategy_id       uuid        NOT NULL REFERENCES strategies(id) ON DELETE CASCADE,
-  exchange          text        NOT NULL CHECK (exchange IN ('binance','bybit')),
+  exchange          text        NOT NULL CHECK (exchange = 'binance'),
   symbol            text        NOT NULL,
   side              text        NOT NULL CHECK (side IN ('long','short')),
   entry_qty         numeric     NOT NULL CHECK (entry_qty > 0),
@@ -173,7 +175,7 @@ CREATE TABLE IF NOT EXISTS fills (
   trade_id          uuid        REFERENCES trades(id) ON DELETE SET NULL,
   client_order_id   uuid        NOT NULL,
   exchange_order_id text        NOT NULL,
-  exchange          text        NOT NULL CHECK (exchange IN ('binance','bybit')),
+  exchange          text        NOT NULL CHECK (exchange = 'binance'),
   symbol            text        NOT NULL,
   side              text        NOT NULL CHECK (side IN ('buy','sell')),
   qty               numeric     NOT NULL CHECK (qty > 0),
@@ -212,7 +214,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
   user_id     uuid        NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   live_run_id uuid        REFERENCES live_runs(id) ON DELETE SET NULL,
   spec_hash   text        NOT NULL CHECK (spec_hash ~ '^[0-9a-f]{64}$'),
-  exchange    text        NOT NULL CHECK (exchange IN ('binance','bybit')),
+  exchange    text        NOT NULL CHECK (exchange = 'binance'),
   action      text        NOT NULL,
   payload     jsonb       NOT NULL DEFAULT '{}'::jsonb,
   result      text        NOT NULL,

@@ -92,9 +92,9 @@
     {
       "name": "live_runs",
       "tenant_column": "user_id",
-      "owner": {"select": true, "insert": true, "update": true, "delete": false},
+      "owner": {"select": true, "insert": false, "update": false, "delete": false},
       "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
-      "notes": "Created by approved go-live action; executor updates status through service paths."
+      "notes": "Readable by owner; created by approved go-live action and updated by executor/service-role paths."
     },
     {
       "name": "positions",
