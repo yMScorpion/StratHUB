@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -37,7 +36,6 @@ jobs:
           enable-cache: true
           cache-dependency-glob: |
             apps/api-ai/pyproject.toml
-            apps/symphony/pyproject.toml
             packages/strategy-spec/py/pyproject.toml
       - run: uv python install 3.12
       - name: strategy-spec — install + test
@@ -53,13 +51,6 @@ jobs:
           uv venv --python 3.12 .venv
           uv pip install --python .venv/bin/python -e .
           uv pip install --python .venv/bin/python --group dev pytest pytest-asyncio
-          .venv/bin/pytest -q
-      - name: symphony — install + test
-        working-directory: apps/symphony
-        run: |
-          uv venv --python 3.12 .venv
-          uv pip install --python .venv/bin/python -e .
-          uv pip install --python .venv/bin/python --group dev pytest
           .venv/bin/pytest -q
 
   node:
