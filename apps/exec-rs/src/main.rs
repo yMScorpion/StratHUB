@@ -16,7 +16,7 @@ use exec_rs::{
     ValidationMetrics, WsReconnectThrottle,
 };
 use futures_util::{SinkExt, StreamExt};
-use rust_decimal::{Decimal, RoundingStrategy};
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -883,6 +883,47 @@ struct BinanceTickerPriceResponse {
     price: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct BinanceExchangeInfoResponse {
+    symbols: Vec<BinanceExchangeSymbol>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceExchangeSymbol {
+    symbol: String,
+    filters: Vec<BinanceSymbolFilter>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceSymbolFilter {
+    #[serde(rename = "filterType")]
+    filter_type: String,
+    #[serde(rename = "stepSize")]
+    step_size: Option<String>,
+    #[serde(rename = "minQty")]
+    min_qty: Option<String>,
+    #[serde(rename = "minNotional")]
+    min_notional: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SymbolTradingFilters {
+    step_size: Decimal,
+    min_qty: Decimal,
+    min_notional: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceAccountResponse {
+    balances: Vec<BinanceBalance>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceBalance {
+    asset: String,
+    free: String,
+}
+
 struct LiveBroker {
     http: reqwest::Client,
     base_url: String,
@@ -1011,6 +1052,113 @@ impl LiveBroker {
         Decimal::from_str_exact(&payload.price).context("parse ticker price decimal")
     }
 
+    async fn symbol_trading_filters(&self, symbol: &str) -> Result<SymbolTradingFilters> {
+        let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.base_url, symbol);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("GET /api/v3/exchangeInfo")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("exchangeInfo failed ({}): {}", status, body);
+        }
+
+        let payload = resp
+            .json::<BinanceExchangeInfoResponse>()
+            .await
+            .context("parse exchangeInfo")?;
+        let symbol_info = payload
+            .symbols
+            .into_iter()
+            .find(|info| info.symbol == symbol)
+            .with_context(|| format!("exchangeInfo missing symbol {symbol}"))?;
+
+        let lot_size = symbol_info
+            .filters
+            .iter()
+            .find(|filter| filter.filter_type == "LOT_SIZE")
+            .with_context(|| format!("exchangeInfo missing LOT_SIZE for {symbol}"))?;
+        let step_size = lot_size
+            .step_size
+            .as_deref()
+            .context("LOT_SIZE missing stepSize")
+            .and_then(|value| Decimal::from_str_exact(value).context("parse stepSize"))?;
+        let min_qty = lot_size
+            .min_qty
+            .as_deref()
+            .context("LOT_SIZE missing minQty")
+            .and_then(|value| Decimal::from_str_exact(value).context("parse minQty"))?;
+
+        let min_notional = symbol_info
+            .filters
+            .iter()
+            .find(|filter| filter.filter_type == "MIN_NOTIONAL" || filter.filter_type == "NOTIONAL")
+            .and_then(|filter| filter.min_notional.as_deref())
+            .map(Decimal::from_str_exact)
+            .transpose()
+            .context("parse minNotional")?
+            .unwrap_or(Decimal::ZERO);
+
+        anyhow::ensure!(
+            step_size > Decimal::ZERO,
+            "exchangeInfo stepSize must be positive"
+        );
+        anyhow::ensure!(
+            min_qty >= Decimal::ZERO,
+            "exchangeInfo minQty must be non-negative"
+        );
+        anyhow::ensure!(
+            min_notional >= Decimal::ZERO,
+            "exchangeInfo minNotional must be non-negative"
+        );
+
+        Ok(SymbolTradingFilters {
+            step_size,
+            min_qty,
+            min_notional,
+        })
+    }
+
+    async fn free_balance(&self, asset: &str) -> Result<Decimal> {
+        let ts = Self::timestamp_ms();
+        let params = format!("timestamp={}", ts);
+        let sig = self.sign(&params);
+        let url = format!(
+            "{}/api/v3/account?{}&signature={}",
+            self.base_url, params, sig
+        );
+
+        let resp = self
+            .http
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("GET /api/v3/account")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("account balance failed ({}): {}", status, body);
+        }
+
+        let payload = resp
+            .json::<BinanceAccountResponse>()
+            .await
+            .context("parse account balance")?;
+        let free = payload
+            .balances
+            .into_iter()
+            .find(|balance| balance.asset == asset)
+            .map(|balance| balance.free)
+            .unwrap_or_else(|| "0".to_string());
+        Decimal::from_str_exact(&free).context("parse free balance")
+    }
+
     async fn get_order_status(
         &self,
         symbol: &str,
@@ -1059,7 +1207,19 @@ fn binance_error_code(body: &str) -> Option<i64> {
         .map(|err| err.code)
 }
 
-fn calculate_live_smoke_qty(quote_cap: Decimal, reference_price: Decimal) -> Result<Decimal> {
+fn floor_to_step(value: Decimal, step_size: Decimal) -> Result<Decimal> {
+    if step_size <= Decimal::ZERO {
+        anyhow::bail!("step size must be positive");
+    }
+
+    Ok((value / step_size).trunc() * step_size)
+}
+
+fn calculate_live_smoke_qty(
+    quote_cap: Decimal,
+    reference_price: Decimal,
+    filters: SymbolTradingFilters,
+) -> Result<Decimal> {
     if quote_cap <= Decimal::ZERO {
         anyhow::bail!("live smoke quote cap must be positive");
     }
@@ -1067,14 +1227,27 @@ fn calculate_live_smoke_qty(quote_cap: Decimal, reference_price: Decimal) -> Res
         anyhow::bail!("live smoke reference price must be positive");
     }
 
-    let qty = (quote_cap * dec!(0.95) / reference_price)
-        .round_dp_with_strategy(6, RoundingStrategy::ToZero);
+    let qty = floor_to_step(quote_cap * dec!(0.95) / reference_price, filters.step_size)?;
 
     if qty <= Decimal::ZERO {
         anyhow::bail!(
             "live smoke quote cap {} is too small for reference price {}",
             quote_cap,
             reference_price
+        );
+    }
+    if qty < filters.min_qty {
+        anyhow::bail!(
+            "live smoke quantity {} is below exchange minQty {}",
+            qty,
+            filters.min_qty
+        );
+    }
+    if qty * reference_price < filters.min_notional {
+        anyhow::bail!(
+            "live smoke notional {} is below exchange minNotional {}",
+            qty * reference_price,
+            filters.min_notional
         );
     }
 
@@ -1120,6 +1293,12 @@ async fn run_live_mode(
              (token is bound to spec_hash={spec_hash}, account_id={}, exchange={})",
             config.account_id,
             exchange.as_str()
+        );
+    }
+
+    if matches!(exchange, Exchange::Bybit) {
+        anyhow::bail!(
+            "phase 6 live/dry-run execution supports only binance; use --exchange binance"
         );
     }
 
@@ -1172,12 +1351,6 @@ async fn run_live_mode(
             })
             .context("write dry_run_complete audit entry")?;
         return Ok(());
-    }
-
-    if matches!(exchange, Exchange::Bybit) {
-        anyhow::bail!(
-            "live execution for bybit is not implemented yet; use --exchange binance for live mode"
-        );
     }
 
     // 5. Live broker.
@@ -1448,8 +1621,16 @@ async fn run_live_smoke(
         .ticker_price(symbol)
         .await
         .context("live smoke: fetch reference price")?;
-    let qty = calculate_live_smoke_qty(config.live_smoke_quote_cap, reference_price)
+    let filters = broker
+        .symbol_trading_filters(symbol)
+        .await
+        .context("live smoke: fetch symbol trading filters")?;
+    let qty = calculate_live_smoke_qty(config.live_smoke_quote_cap, reference_price, filters)
         .context("live smoke: calculate quote-capped quantity")?;
+    let pre_buy_free_base = broker
+        .free_balance("BTC")
+        .await
+        .context("live smoke: fetch free base balance before buy")?;
 
     tracing::info!(
         symbol,
@@ -1544,14 +1725,49 @@ async fn run_live_smoke(
         anyhow::bail!("live smoke reconciliation mismatch: {recon:?}");
     }
 
-    // Step 3: Close position with market sell.
+    // Step 3: Close position with a sellable free balance, accounting for base-asset fees.
+    let post_buy_free_base = broker
+        .free_balance("BTC")
+        .await
+        .context("live smoke: fetch free base balance before close")?;
+    let sellable_delta = if post_buy_free_base > pre_buy_free_base {
+        post_buy_free_base - pre_buy_free_base
+    } else {
+        Decimal::ZERO
+    };
+    let sell_qty = floor_to_step(exec_qty.min(sellable_delta), filters.step_size)
+        .context("live smoke: calculate sellable close quantity")?;
+    if sell_qty < filters.min_qty {
+        anyhow::bail!(
+            "live smoke sellable quantity {} is below exchange minQty {}; pre_buy_free_base={}, post_buy_free_base={}, executed_qty={}",
+            sell_qty,
+            filters.min_qty,
+            pre_buy_free_base,
+            post_buy_free_base,
+            exec_qty
+        );
+    }
+    if sell_qty * reference_price < filters.min_notional {
+        anyhow::bail!(
+            "live smoke sell notional {} is below exchange minNotional {}; pre_buy_free_base={}, post_buy_free_base={}, executed_qty={}",
+            sell_qty * reference_price,
+            filters.min_notional,
+            pre_buy_free_base,
+            post_buy_free_base,
+            exec_qty
+        );
+    }
+    if sell_qty < exec_qty {
+        positions.update_fill(symbol, Side::Sell, exec_qty - sell_qty);
+    }
+
     let sell_coid = deterministic_client_order_id(spec_hash, &format!("smoke-sell-{run_id}"));
     let sell = broker
-        .place_market_order(symbol, Side::Sell, exec_qty, sell_coid)
+        .place_market_order(symbol, Side::Sell, sell_qty, sell_coid)
         .await
         .context("live smoke: place sell order")?;
 
-    positions.update_fill(symbol, Side::Sell, exec_qty);
+    positions.update_fill(symbol, Side::Sell, sell_qty);
 
     tracing::info!(
         order_id = sell.order_id,
@@ -1566,6 +1782,11 @@ async fn run_live_smoke(
                 "order_id": sell.order_id,
                 "client_order_id": sell_coid.to_string(),
                 "status": sell.status,
+                "sell_qty": sell_qty.to_string(),
+                "pre_buy_free_base": pre_buy_free_base.to_string(),
+                "post_buy_free_base": post_buy_free_base.to_string(),
+                "sellable_delta": sellable_delta.to_string(),
+                "executed_buy_qty": exec_qty.to_string(),
             }),
             ..base_entry.clone()
         })
@@ -1653,10 +1874,31 @@ mod tests {
 
     #[test]
     fn live_smoke_quantity_uses_quote_cap_with_buffer() {
-        let qty = calculate_live_smoke_qty(dec!(45), dec!(55000)).unwrap();
-        assert_eq!(qty, dec!(0.000777));
+        let filters = SymbolTradingFilters {
+            step_size: dec!(0.00001000),
+            min_qty: dec!(0.00001000),
+            min_notional: dec!(5),
+        };
+
+        let qty = calculate_live_smoke_qty(dec!(45), dec!(55000), filters).unwrap();
+        assert_eq!(qty, dec!(0.00077000));
         assert!(qty * dec!(55000) < dec!(45));
-        assert!(calculate_live_smoke_qty(dec!(0), dec!(55000)).is_err());
-        assert!(calculate_live_smoke_qty(dec!(45), dec!(0)).is_err());
+        assert!(calculate_live_smoke_qty(dec!(0), dec!(55000), filters).is_err());
+        assert!(calculate_live_smoke_qty(dec!(45), dec!(0), filters).is_err());
+    }
+
+    #[test]
+    fn live_smoke_quantity_rejects_exchange_filter_violations() {
+        let filters = SymbolTradingFilters {
+            step_size: dec!(0.00001000),
+            min_qty: dec!(0.001),
+            min_notional: dec!(5),
+        };
+
+        assert!(calculate_live_smoke_qty(dec!(45), dec!(55000), filters).is_err());
+        assert_eq!(
+            floor_to_step(dec!(0.000777), dec!(0.00001000)).unwrap(),
+            dec!(0.00077000)
+        );
     }
 }
