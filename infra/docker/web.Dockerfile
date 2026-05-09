@@ -36,7 +36,34 @@ fs.rmSync(nextDir, { recursive: true, force: true });\
 fs.cpSync(patchedDir, nextDir, { recursive: true });\
 "
 RUN pnpm --filter @cts/web build
-RUN find apps/web/.next/standalone -path '*/next/dist/compiled/picomatch/package.json' -print -delete
+RUN node -e "\
+const fs = require('node:fs');\
+const path = require('node:path');\
+const pnpmStore = path.join(process.cwd(), 'node_modules/.pnpm');\
+const patchedEntry = fs.readdirSync(pnpmStore).find((entry) => entry.startsWith('picomatch@4.0.4'));\
+if (!patchedEntry) throw new Error('picomatch@4.0.4 not found in pnpm store');\
+const patchedDir = path.join(pnpmStore, patchedEntry, 'node_modules/picomatch');\
+const standalone = path.join(process.cwd(), 'apps/web/.next/standalone');\
+const targets = [];\
+const walk = (dir) => {\
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {\
+    const child = path.join(dir, entry.name);\
+    if (!entry.isDirectory()) continue;\
+    if (child.endsWith(path.join('next', 'dist', 'compiled', 'picomatch'))) {\
+      targets.push(child);\
+      continue;\
+    }\
+    walk(child);\
+  }\
+};\
+walk(standalone);\
+if (targets.length === 0) throw new Error('standalone picomatch bundle not found');\
+for (const target of targets) {\
+  fs.rmSync(target, { recursive: true, force: true });\
+  fs.cpSync(patchedDir, target, { recursive: true });\
+  console.log(target);\
+}\
+"
 
 FROM node:22-bookworm-slim AS runner
 WORKDIR /repo
