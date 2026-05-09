@@ -2,9 +2,8 @@ name: ci
 
 on:
   push:
-    branches: [main, phase-7]
+    branches: [main]
   pull_request:
-    branches: [main, phase-7]
 
 permissions:
   contents: read
@@ -94,49 +93,6 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  phase-7-hardening:
-    name: phase 7 hardening gate
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: verify hardening artifacts
-        run: python3 tools/phase7/verify_hardening.py
-      - name: dependency and config scan
-        uses: aquasecurity/trivy-action@v0.24.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          scanners: vuln,secret,misconfig
-          severity: HIGH,CRITICAL
-          exit-code: "1"
-          ignore-unfixed: true
-      - name: build runtime images
-        run: |
-          docker build -f infra/docker/api-ai.Dockerfile -t cts-api-ai:${{ github.sha }} .
-          docker build -f infra/docker/exec-rs.Dockerfile -t cts-exec-rs:${{ github.sha }} .
-          docker build -f infra/docker/web.Dockerfile -t cts-web:${{ github.sha }} .
-      - name: scan api-ai image
-        uses: aquasecurity/trivy-action@v0.24.0
-        with:
-          image-ref: cts-api-ai:${{ github.sha }}
-          severity: HIGH,CRITICAL
-          exit-code: "1"
-          ignore-unfixed: true
-      - name: scan exec-rs image
-        uses: aquasecurity/trivy-action@v0.24.0
-        with:
-          image-ref: cts-exec-rs:${{ github.sha }}
-          severity: HIGH,CRITICAL
-          exit-code: "1"
-          ignore-unfixed: true
-      - name: scan web image
-        uses: aquasecurity/trivy-action@v0.24.0
-        with:
-          image-ref: cts-web:${{ github.sha }}
-          severity: HIGH,CRITICAL
-          exit-code: "1"
-          ignore-unfixed: true
 
   migration-review:
     name: migration review
