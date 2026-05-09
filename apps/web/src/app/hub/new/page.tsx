@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useRef, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 
 interface FileEntry {
@@ -32,11 +33,17 @@ export default function NewStrategyPage() {
 
   const addFiles = useCallback((incoming: FileList | File[]) => {
     const arr = Array.from(incoming);
+    const rejected = arr.length;
     const valid = arr.filter((f) => {
       if (f.type !== "application/pdf") return false;
       if (f.size > MAX_BYTES) return false;
       return true;
     });
+    if (valid.length !== rejected) {
+      setGlobalError("Some files were skipped. Upload PDF files up to 25 MB each.");
+    } else {
+      setGlobalError(null);
+    }
     setFiles((prev) => {
       const combined = [...prev, ...valid.map<FileEntry>((f) => ({
         file: f,
@@ -45,6 +52,9 @@ export default function NewStrategyPage() {
         status: "hashing",
         progress: 0,
       }))].slice(0, MAX_FILES);
+      if (prev.length + valid.length > MAX_FILES) {
+        setGlobalError(`Only the first ${MAX_FILES} files were added.`);
+      }
       return combined;
     });
   }, []);
@@ -56,6 +66,13 @@ export default function NewStrategyPage() {
 
   function handleInputChange(e: React.ChangeEvent<HTMLInputElement>) {
     if (e.target.files) addFiles(e.target.files);
+  }
+
+  function handleDropzoneKey(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      inputRef.current?.click();
+    }
   }
 
   async function startUpload() {
@@ -132,41 +149,66 @@ export default function NewStrategyPage() {
     setTimeout(() => router.push("/hub"), 1500);
   }
 
-  const allDone = files.length > 0 && files.every((f) => f.status === "done");
+  const isBusy = phase === "uploading" || phase === "submitting";
+  const canSubmit = files.length > 0 && phase === "select";
+
+  function fileStatusClass(status: FileEntry["status"]) {
+    if (status === "done") return "status-done";
+    if (status === "error") return "status-error";
+    return "status-neutral";
+  }
 
   return (
-    <main style={{ padding: "2rem 4rem", maxWidth: 700 }}>
-      <h1 style={{ fontWeight: 600, fontSize: "1.5rem", marginBottom: "1.5rem" }}>
-        New strategy from PDF
-      </h1>
+    <main className="fade-in">
+      <nav aria-label="Primary" className="topbar">
+        <Link className="brand" href="/">
+          <span className="brand-mark" aria-hidden="true">S</span>
+          <span>StratHUB</span>
+        </Link>
+        <div className="topnav">
+          <Link className="nav-link" href="/hub">Hub</Link>
+          <Link className="nav-link" href="/hub/new">Upload</Link>
+          <Link className="nav-link" href="/login">Sign in</Link>
+        </div>
+      </nav>
+
+      <header className="page-header">
+        <div>
+          <p className="eyebrow">Source ingestion</p>
+          <h1 className="section-title">New strategy from PDF</h1>
+          <p className="subtle">
+            Add source documents, hash them locally, and submit a compile job for review.
+          </p>
+        </div>
+        <Link className="button button-secondary" href="/hub">Back to hub</Link>
+      </header>
 
       {phase === "done" ? (
-        <p style={{ color: "#22c55e", fontSize: "1.1rem" }}>
-          ✓ Job submitted! Redirecting to hub…
-        </p>
+        <section className="success-note" role="status" aria-live="polite">
+          <h2 className="section-title">Job submitted</h2>
+          <p>Redirecting to the Strategy Hub...</p>
+          {jobId && <p className="mono">Job {jobId}</p>}
+        </section>
       ) : (
         <>
-          {/* Drop zone */}
-          <div
-            onDrop={handleDrop}
-            onDragOver={(e) => e.preventDefault()}
-            onClick={() => inputRef.current?.click()}
-            style={{
-              border: "2px dashed #d1d5db",
-              borderRadius: 10,
-              padding: "3rem",
-              textAlign: "center",
-              cursor: "pointer",
-              marginBottom: "1.5rem",
-              background: "#f9fafb",
-            }}
-          >
-            <p style={{ opacity: 0.6, margin: 0 }}>
-              Drop PDF files here, or click to browse
-            </p>
-            <p style={{ opacity: 0.4, fontSize: "0.8rem", margin: "0.4rem 0 0" }}>
-              Max {MAX_FILES} files · 25 MB each · PDF only
-            </p>
+          <section className="panel panel-pad">
+            <div
+              className="dropzone"
+              onDrop={handleDrop}
+              onDragOver={(e) => e.preventDefault()}
+              onClick={() => inputRef.current?.click()}
+              onKeyDown={handleDropzoneKey}
+              role="button"
+              tabIndex={0}
+              aria-label="Choose PDF files to upload"
+            >
+              <div>
+                <p className="dropzone-title">Drop PDFs here, or click to browse</p>
+                <p className="dropzone-hint">
+                  Max {MAX_FILES} files, 25 MB each. PDF sources only.
+                </p>
+              </div>
+            </div>
             <input
               ref={inputRef}
               type="file"
@@ -175,66 +217,60 @@ export default function NewStrategyPage() {
               style={{ display: "none" }}
               onChange={handleInputChange}
             />
-          </div>
 
-          {/* File list */}
-          {files.length > 0 && (
-            <ul style={{ listStyle: "none", padding: 0, marginBottom: "1.5rem" }}>
-              {files.map((f, i) => (
-                <li
-                  key={i}
-                  style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    padding: "0.4rem 0",
-                    borderBottom: "1px solid #f3f4f6",
-                    fontSize: "0.875rem",
-                  }}
-                >
-                  <span style={{ maxWidth: "70%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {f.file.name}
-                  </span>
-                  <span style={{ opacity: 0.6, marginLeft: "0.5rem" }}>
-                    {(f.file.size / 1024 / 1024).toFixed(1)} MB
-                  </span>
-                  <span
-                    style={{
-                      color: f.status === "done" ? "#22c55e" : f.status === "error" ? "#ef4444" : "#6b7280",
-                      marginLeft: "0.75rem",
-                    }}
-                  >
-                    {f.status === "done" ? "✓" : f.status === "error" ? "✗" : f.status}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
+            {files.length > 0 ? (
+              <ul className="file-list" aria-label="Selected files">
+                {files.map((f, i) => (
+                  <li className="file-row" key={`${f.file.name}-${i}`}>
+                    <span className="file-name" title={f.file.name}>
+                      {f.file.name}
+                    </span>
+                    <span className="file-meta">
+                      {(f.file.size / 1024 / 1024).toFixed(1)} MB
+                    </span>
+                    <span className={`status-pill ${fileStatusClass(f.status)}`}>
+                      {f.status}
+                    </span>
+                    {f.error && <span className="alert">{f.error}</span>}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <div className="empty-state" aria-live="polite">
+                <div className="empty-state-inner">
+                  <div className="empty-icon" aria-hidden="true">PDF</div>
+                  <h2 className="section-title">No files selected</h2>
+                  <p className="subtle">
+                    Choose the source PDFs that define the methodology. They stay queued here before upload starts.
+                  </p>
+                </div>
+              </div>
+            )}
 
-          {globalError && (
-            <p style={{ color: "#ef4444", marginBottom: "1rem" }}>{globalError}</p>
-          )}
+            {globalError && (
+              <p className="alert" role="alert">{globalError}</p>
+            )}
 
-          <button
-            onClick={startUpload}
-            disabled={files.length === 0 || phase === "uploading" || phase === "submitting"}
-            style={{
-              padding: "0.65rem 1.5rem",
-              background: "#2563eb",
-              color: "#fff",
-              border: "none",
-              borderRadius: 6,
-              cursor: "pointer",
-              fontSize: "1rem",
-              opacity: files.length === 0 || phase !== "select" ? 0.5 : 1,
-            }}
-          >
-            {phase === "uploading"
-              ? "Uploading…"
-              : phase === "submitting"
-              ? "Submitting…"
-              : `Upload & process ${files.length > 0 ? `(${files.length})` : ""}`}
-          </button>
+            <div className="actions">
+              <button
+                className="button"
+                onClick={startUpload}
+                disabled={!canSubmit}
+                aria-busy={isBusy}
+              >
+                {phase === "uploading"
+                  ? "Uploading..."
+                  : phase === "submitting"
+                    ? "Submitting..."
+                    : `Upload and process${files.length > 0 ? ` (${files.length})` : ""}`}
+              </button>
+              {files.length > 0 && phase === "select" && (
+                <button className="button button-secondary" type="button" onClick={() => setFiles([])}>
+                  Clear
+                </button>
+              )}
+            </div>
+          </section>
         </>
       )}
     </main>
