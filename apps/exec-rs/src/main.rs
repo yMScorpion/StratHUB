@@ -1414,12 +1414,10 @@ fn kill_switch_cancel_symbols(
 }
 
 fn flatten_order_for_position(qty: Decimal) -> Option<(Side, Decimal)> {
-    if qty > Decimal::ZERO {
-        Some((Side::Sell, qty))
-    } else if qty < Decimal::ZERO {
-        Some((Side::Buy, qty.abs()))
-    } else {
-        None
+    match qty.cmp(&Decimal::ZERO) {
+        std::cmp::Ordering::Greater => Some((Side::Sell, qty)),
+        std::cmp::Ordering::Less => Some((Side::Buy, qty.abs())),
+        std::cmp::Ordering::Equal => None,
     }
 }
 
