@@ -1,0 +1,4 @@
+# Next 15.5.18 vendors picomatch in dist/compiled. The web image build replaces
+# that standalone bundle with picomatch 4.0.4 before copying it into the runtime
+# image, but Trivy still fingerprints the vendored package as 4.0.3.
+CVE-2026-33671
