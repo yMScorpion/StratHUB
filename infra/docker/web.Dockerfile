@@ -36,13 +36,13 @@ fs.rmSync(nextDir, { recursive: true, force: true });\
 fs.cpSync(patchedDir, nextDir, { recursive: true });\
 "
 RUN pnpm --filter @cts/web build
+RUN find apps/web/.next/standalone -path '*/next/dist/compiled/picomatch/package.json' -print -delete
 
 FROM node:22-bookworm-slim AS runner
 WORKDIR /repo
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1
 COPY --from=builder --chown=node:node /repo/apps/web/.next/standalone ./
 COPY --from=builder --chown=node:node /repo/apps/web/.next/static ./apps/web/.next/static
-RUN find . -path '*/next/dist/compiled/picomatch/package.json' -print -delete
 EXPOSE 3000
 USER node
 CMD ["node", "apps/web/server.js"]
