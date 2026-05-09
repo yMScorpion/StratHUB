@@ -5,6 +5,24 @@
 
 SET search_path = public;
 
+CREATE OR REPLACE FUNCTION enforce_account_api_key_owner()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.api_key_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1
+      FROM api_keys
+     WHERE api_keys.id = NEW.api_key_id
+       AND api_keys.user_id = NEW.user_id
+  ) THEN
+    RAISE EXCEPTION 'accounts.api_key_id must belong to accounts.user_id';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
 -- accounts: user-managed exchange accounts eligible for live execution.
 CREATE TABLE IF NOT EXISTS accounts (
   id                  uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -22,10 +40,16 @@ CREATE TABLE IF NOT EXISTS accounts (
 );
 
 CREATE INDEX IF NOT EXISTS accounts_user_idx ON accounts (user_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS accounts_id_user_id_unique_idx
+  ON accounts (id, user_id);
 
 CREATE TRIGGER accounts_set_updated_at
   BEFORE UPDATE ON accounts
   FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TRIGGER accounts_api_key_owner_guard
+  BEFORE INSERT OR UPDATE OF api_key_id, user_id ON accounts
+  FOR EACH ROW EXECUTE FUNCTION enforce_account_api_key_owner();
 
 ALTER TABLE accounts ENABLE ROW LEVEL SECURITY;
 
@@ -60,7 +84,9 @@ CREATE TABLE IF NOT EXISTS live_runs (
   stopped_at            timestamptz,
   error                 text,
   created_at            timestamptz NOT NULL DEFAULT now(),
-  updated_at            timestamptz NOT NULL DEFAULT now()
+  updated_at            timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT live_runs_account_owner_fk
+    FOREIGN KEY (account_id, user_id) REFERENCES accounts(id, user_id) ON DELETE RESTRICT
 );
 
 CREATE INDEX IF NOT EXISTS live_runs_user_status_idx

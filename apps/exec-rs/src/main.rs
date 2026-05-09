@@ -57,6 +57,10 @@ struct Args {
     #[arg(long, env = "EXEC_ACCOUNT_ID")]
     account_id: Option<String>,
 
+    /// User id that owns the live account (required for live audit/compliance records).
+    #[arg(long, env = "EXEC_USER_ID")]
+    user_id: Option<String>,
+
     /// Optional run id for tracing/correlation. Auto-generated if omitted.
     #[arg(long, env = "EXEC_RUN_ID")]
     run_id: Option<String>,
@@ -247,6 +251,10 @@ async fn main() -> Result<()> {
                 .account_id
                 .clone()
                 .context("--account-id is required in live mode")?;
+            let user_id = args
+                .user_id
+                .clone()
+                .context("--user-id (EXEC_USER_ID) is required in live mode")?;
 
             // KMS envelope decrypt: EXEC_KMS_DEK_HEX is the DEK returned by cloud KMS.Decrypt;
             // it is never logged, stored, or passed to child processes.
@@ -305,7 +313,7 @@ async fn main() -> Result<()> {
                 .transpose()?;
 
             let compliance = ComplianceRecord {
-                user_id: account_id.clone(),
+                user_id: user_id.clone(),
                 jurisdiction: args.jurisdiction.clone(),
                 tos_accepted_at,
                 risk_ack_at,
@@ -326,6 +334,7 @@ async fn main() -> Result<()> {
                 args.exchange.into(),
                 creds,
                 LiveModeConfig {
+                    user_id,
                     account_id,
                     confirm_token,
                     confirm_token_digest,
@@ -854,6 +863,7 @@ fn parse_broker_key_scope(raw_scopes: &[String]) -> Result<Vec<String>> {
 
 #[derive(Debug, Clone)]
 struct LiveModeConfig {
+    user_id: String,
     account_id: String,
     confirm_token: String,
     confirm_token_digest: String,
@@ -1263,6 +1273,11 @@ fn calculate_live_smoke_qty(
     Ok(qty)
 }
 
+fn parse_exchange_executed_qty(order: &ExchangeOrderResponse, context: &str) -> Result<Decimal> {
+    Decimal::from_str_exact(&order.executed_qty)
+        .with_context(|| format!("{context}: parse executedQty {}", order.executed_qty))
+}
+
 async fn run_live_mode(
     spec: &Value,
     spec_hash: &str,
@@ -1312,7 +1327,7 @@ async fn run_live_mode(
 
     let base_entry = AuditEntry {
         ts: chrono::Utc::now(),
-        user_id: config.account_id.clone(),
+        user_id: config.user_id.clone(),
         run_id: run_id.to_string(),
         spec_hash: spec_hash.to_string(),
         exchange,
@@ -1630,7 +1645,7 @@ async fn run_live_smoke(
 
     let base_entry = AuditEntry {
         ts: chrono::Utc::now(),
-        user_id: config.account_id.clone(),
+        user_id: config.user_id.clone(),
         run_id: run_id.to_string(),
         spec_hash: spec_hash.to_string(),
         exchange,
@@ -1678,7 +1693,7 @@ async fn run_live_smoke(
         "live smoke: buy filled"
     );
 
-    let exec_qty = Decimal::from_str_exact(&buy.executed_qty).unwrap_or(qty);
+    let exec_qty = parse_exchange_executed_qty(&buy, "live smoke: buy response")?;
     positions.update_fill(symbol, Side::Buy, exec_qty);
 
     audit
@@ -1790,22 +1805,39 @@ async fn run_live_smoke(
         .await
         .context("live smoke: place sell order")?;
 
-    positions.update_fill(symbol, Side::Sell, sell_qty);
+    let final_sell = if sell.status == "FILLED" {
+        sell
+    } else {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        broker
+            .get_order_status(symbol, sell_coid)
+            .await?
+            .with_context(|| {
+                format!("live smoke: broker status missing for sell order {sell_coid}")
+            })?
+    };
+    let executed_sell_qty = parse_exchange_executed_qty(&final_sell, "live smoke: sell response")?;
+    if executed_sell_qty > Decimal::ZERO {
+        positions.update_fill(symbol, Side::Sell, executed_sell_qty);
+    }
 
     tracing::info!(
-        order_id = sell.order_id,
-        status = %sell.status,
-        "live smoke: sell filled; position closed"
+        order_id = final_sell.order_id,
+        status = %final_sell.status,
+        requested_qty = %sell_qty,
+        executed_qty = %executed_sell_qty,
+        "live smoke: sell status received"
     );
 
     audit
         .write(&AuditEntry {
             action: "live_smoke_sell".to_string(),
             payload: json!({
-                "order_id": sell.order_id,
+                "order_id": final_sell.order_id,
                 "client_order_id": sell_coid.to_string(),
-                "status": sell.status,
+                "status": final_sell.status.clone(),
                 "sell_qty": sell_qty.to_string(),
+                "executed_sell_qty": executed_sell_qty.to_string(),
                 "pre_buy_free_base": pre_buy_free_base.to_string(),
                 "post_buy_free_base": post_buy_free_base.to_string(),
                 "sellable_delta": sellable_delta.to_string(),
@@ -1815,6 +1847,20 @@ async fn run_live_smoke(
         })
         .context("write live_smoke_sell audit entry")?;
 
+    anyhow::ensure!(
+        final_sell.status == "FILLED",
+        "live smoke sell order ended with status {} after executing {} of requested {}",
+        final_sell.status,
+        executed_sell_qty,
+        sell_qty
+    );
+    anyhow::ensure!(
+        executed_sell_qty >= sell_qty,
+        "live smoke sell executed {} below requested {}; position left open: {:?}",
+        executed_sell_qty,
+        sell_qty,
+        positions.positions
+    );
     anyhow::ensure!(
         positions.is_flat(),
         "live smoke complete but position not flat: {:?}",
