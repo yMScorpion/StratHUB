@@ -78,7 +78,7 @@ export default async function HubPage() {
                 <th scope="col">Status</th>
                 <th scope="col">Created</th>
                 <th scope="col">
-                  <span className="subtle">Action</span>
+                  <span className="subtle">Actions</span>
                 </th>
               </tr>
             </thead>
@@ -101,9 +101,14 @@ export default async function HubPage() {
                     }).format(new Date(s.created_at))}
                   </td>
                   <td>
-                    <Link className="button button-secondary" href={`/strategies/${s.id}/review`}>
-                      Review
-                    </Link>
+                    <div className="actions">
+                      <Link className="button button-secondary" href={`/strategies/${s.id}/review`}>
+                        Review
+                      </Link>
+                      <Link className="button button-secondary" href={`/strategies/${s.id}/validate`}>
+                        Validate
+                      </Link>
+                    </div>
                   </td>
                 </tr>
               ))}
