@@ -42,7 +42,7 @@ WORKDIR /repo
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1
 COPY --from=builder --chown=node:node /repo/apps/web/.next/standalone ./
 COPY --from=builder --chown=node:node /repo/apps/web/.next/static ./apps/web/.next/static
-RUN find node_modules -path '*/next/dist/compiled/picomatch/package.json' -delete
+RUN find . -path '*/next/dist/compiled/picomatch/package.json' -print -delete
 EXPOSE 3000
 USER node
 CMD ["node", "apps/web/server.js"]
