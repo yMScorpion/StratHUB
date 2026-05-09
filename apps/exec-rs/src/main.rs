@@ -1387,6 +1387,23 @@ async fn run_live_mode(
         return Ok(());
     }
 
+    if !config.live_smoke {
+        audit
+            .write(&AuditEntry {
+                action: "live_strategy_rejected".to_string(),
+                payload: json!({
+                    "reason": "non-smoke live strategy execution is not wired to the strategy interpreter",
+                    "use_live_smoke": true,
+                }),
+                result: "rejected".to_string(),
+                ..base_entry.clone()
+            })
+            .context("write live_strategy_rejected audit entry")?;
+        anyhow::bail!(
+            "non-smoke live strategy execution is not supported yet; use --dry-run for pre-flight checks or --live-smoke for the Phase 6 broker round-trip"
+        );
+    }
+
     // 8. Kill-switch signal handler (SIGTERM / Ctrl-C → atomic flag).
     let kill_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let kf = kill_flag.clone();
@@ -1458,9 +1475,12 @@ async fn run_live_mode(
         tokio::select! {
             msg = ws.next() => {
                 match msg {
-                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(_))) => {
-                        // Phase 4 strategy interpreter generates OrderIntents here.
-                        // Phase 6 verifies the plumbing via --live-smoke.
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        if parse_trade_tick(exchange, symbol, &text).is_some() {
+                            anyhow::bail!(
+                                "non-smoke live strategy execution is not supported yet; refusing to ignore live market ticks"
+                            );
+                        }
                     }
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(p))) => {
                         ws.send(tokio_tungstenite::tungstenite::Message::Pong(p)).await.ok();
