@@ -63,10 +63,38 @@
       "notes": "Executor telemetry updates arrive through service event-ingest."
     },
     {
+      "name": "validation_events",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": false, "update": false, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Append-only service event-ingest writes."
+    },
+    {
+      "name": "validation_heartbeats",
+      "tenant_column": "validation_id",
+      "owner": {"select": true, "insert": false, "update": false, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Readable through validation owner join; service event-ingest owns writes."
+    },
+    {
+      "name": "paper_fills",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": false, "update": false, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Paper executor writes virtual fills through service event-ingest."
+    },
+    {
       "name": "accounts",
       "tenant_column": "user_id",
       "owner": {"select": true, "insert": true, "update": true, "delete": false},
       "other_tenant": {"select": false, "insert": false, "update": false, "delete": false}
+    },
+    {
+      "name": "live_runs",
+      "tenant_column": "user_id",
+      "owner": {"select": true, "insert": false, "update": false, "delete": false},
+      "other_tenant": {"select": false, "insert": false, "update": false, "delete": false},
+      "notes": "Readable by owner; created by approved go-live action and updated by executor/service-role paths."
     },
     {
       "name": "positions",

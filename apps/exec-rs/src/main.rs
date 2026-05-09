@@ -4,12 +4,19 @@
 //! for adapter smoke tests, not strategy validation.
 
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use exec_rs::{
-    evaluate_scorecard, ClockSkewMonitor, Exchange, Fill, MarketTick, OrderIntent, OrderOutbox,
-    OutboxStatus, PaperBroker, RiskGuard, RiskLimits, RiskState, ScorecardThresholds, Side,
+    check_compliance_gate, decrypt_broker_key, deterministic_client_order_id, evaluate_scorecard,
+    reconcile_fill, AuditEntry, AuditLog, BrokerCredentials, ClockSkewMonitor, ComplianceError,
+    ComplianceRecord, ConfirmationGate, Exchange, Fill, KillSwitchAction, LivePositionState,
+    LocalRiskCache, MarketTick, OrderIntent, OrderOutbox, OutboxStatus, PaperBroker,
+    ReconciliationCheck, RiskGuard, RiskLimits, RiskState, ScorecardThresholds, Side,
     ValidationMetrics, WsReconnectThrottle,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -54,6 +61,10 @@ struct Args {
     #[arg(long, env = "EXEC_ACCOUNT_ID")]
     account_id: Option<String>,
 
+    /// User id that owns the live account (required for live audit/compliance records).
+    #[arg(long, env = "EXEC_USER_ID")]
+    user_id: Option<String>,
+
     /// Optional run id for tracing/correlation. Auto-generated if omitted.
     #[arg(long, env = "EXEC_RUN_ID")]
     run_id: Option<String>,
@@ -97,6 +108,67 @@ struct Args {
     /// Optional wall-clock cap for integration tests and supervised shutdowns.
     #[arg(long, env = "EXEC_VALIDATION_MAX_SECONDS")]
     validation_max_seconds: Option<u64>,
+
+    // ---- Live mode args (Phase 6) ----
+    /// Nonce hex for encrypted API key (AES-256-GCM, 12 bytes).
+    #[arg(long, env = "EXEC_KMS_KEY_NONCE_HEX")]
+    kms_key_nonce_hex: Option<String>,
+
+    /// Ciphertext hex for encrypted API key.
+    #[arg(long, env = "EXEC_KMS_KEY_CIPHERTEXT_HEX")]
+    kms_key_ciphertext_hex: Option<String>,
+
+    /// Nonce hex for encrypted API secret.
+    #[arg(long, env = "EXEC_KMS_SECRET_NONCE_HEX")]
+    kms_secret_nonce_hex: Option<String>,
+
+    /// Ciphertext hex for encrypted API secret.
+    #[arg(long, env = "EXEC_KMS_SECRET_CIPHERTEXT_HEX")]
+    kms_secret_ciphertext_hex: Option<String>,
+
+    /// Stored broker-key scopes from trusted metadata (comma-separated, e.g. "trade,read").
+    #[arg(long, env = "EXEC_BROKER_KEY_SCOPE", value_delimiter = ',')]
+    broker_key_scope: Vec<String>,
+
+    /// Hold-to-confirm token supplied by the user for this live session.
+    #[arg(long, env = "EXEC_CONFIRM_TOKEN")]
+    confirm_token: Option<String>,
+
+    /// Server-recorded SHA-256 digest of the hold-to-confirm token.
+    #[arg(long, env = "EXEC_CONFIRM_TOKEN_DIGEST")]
+    confirm_token_digest: Option<String>,
+
+    /// Flatten all open positions (market sell) when kill-switch fires.
+    #[arg(long, env = "EXEC_FLATTEN_ON_KILL_SWITCH")]
+    flatten_on_kill_switch: bool,
+
+    /// Directory for live audit log JSONL files.
+    #[arg(long, default_value = ".exec-rs-audit", env = "EXEC_AUDIT_LOG_DIR")]
+    audit_log_dir: std::path::PathBuf,
+
+    /// Skip order placement; run all pre-flight checks only. Safe for verifying config.
+    #[arg(long, env = "EXEC_DRY_RUN")]
+    dry_run: bool,
+
+    /// Run a single round-trip order for verification ($50 sub-account smoke test).
+    #[arg(long, env = "EXEC_LIVE_SMOKE")]
+    live_smoke: bool,
+
+    /// Quote-currency cap for live smoke buy notional.
+    #[arg(long, default_value = "45", env = "EXEC_LIVE_SMOKE_QUOTE_CAP")]
+    live_smoke_quote_cap: Decimal,
+
+    /// User jurisdiction code (e.g. "US"). Passed from API layer after profile check.
+    #[arg(long, env = "EXEC_JURISDICTION")]
+    jurisdiction: Option<String>,
+
+    /// RFC-3339 timestamp when user accepted the terms of service.
+    #[arg(long, env = "EXEC_TOS_ACCEPTED_AT")]
+    tos_accepted_at: Option<String>,
+
+    /// RFC-3339 timestamp when user completed the risk acknowledgement.
+    #[arg(long, env = "EXEC_RISK_ACK_AT")]
+    risk_ack_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -179,7 +251,107 @@ async fn main() -> Result<()> {
             .await?;
         }
         Mode::Live => {
-            tracing::info!("live dispatch guarded until phase 6 capital controls are enabled");
+            let account_id = args
+                .account_id
+                .clone()
+                .context("--account-id is required in live mode")?;
+            let user_id = args
+                .user_id
+                .clone()
+                .context("--user-id (EXEC_USER_ID) is required in live mode")?;
+
+            // KMS envelope decrypt: EXEC_KMS_DEK_HEX is the DEK returned by cloud KMS.Decrypt;
+            // it is never logged, stored, or passed to child processes.
+            let dek_hex = std::env::var("EXEC_KMS_DEK_HEX").context(
+                "EXEC_KMS_DEK_HEX required in live mode (set by launcher after KMS.Decrypt)",
+            )?;
+
+            let api_key = decrypt_broker_key(
+                &dek_hex,
+                &args
+                    .kms_key_nonce_hex
+                    .clone()
+                    .context("--kms-key-nonce-hex required in live mode")?,
+                &args
+                    .kms_key_ciphertext_hex
+                    .clone()
+                    .context("--kms-key-ciphertext-hex required in live mode")?,
+            )
+            .context("KMS decrypt API key")?;
+
+            let api_secret = decrypt_broker_key(
+                &dek_hex,
+                &args
+                    .kms_secret_nonce_hex
+                    .clone()
+                    .context("--kms-secret-nonce-hex required in live mode")?,
+                &args
+                    .kms_secret_ciphertext_hex
+                    .clone()
+                    .context("--kms-secret-ciphertext-hex required in live mode")?,
+            )
+            .context("KMS decrypt API secret")?;
+
+            let creds = BrokerCredentials {
+                api_key,
+                api_secret,
+                scope: parse_broker_key_scope(&args.broker_key_scope)?,
+            };
+
+            let tos_accepted_at = args
+                .tos_accepted_at
+                .as_deref()
+                .map(|s| {
+                    s.parse::<chrono::DateTime<chrono::Utc>>()
+                        .context("parse EXEC_TOS_ACCEPTED_AT as RFC-3339")
+                })
+                .transpose()?;
+
+            let risk_ack_at = args
+                .risk_ack_at
+                .as_deref()
+                .map(|s| {
+                    s.parse::<chrono::DateTime<chrono::Utc>>()
+                        .context("parse EXEC_RISK_ACK_AT as RFC-3339")
+                })
+                .transpose()?;
+
+            let compliance = ComplianceRecord {
+                user_id: user_id.clone(),
+                jurisdiction: args.jurisdiction.clone(),
+                tos_accepted_at,
+                risk_ack_at,
+            };
+
+            let confirm_token = args
+                .confirm_token
+                .clone()
+                .context("--confirm-token (EXEC_CONFIRM_TOKEN) is required in live mode")?;
+            let confirm_token_digest = args.confirm_token_digest.clone().context(
+                "--confirm-token-digest (EXEC_CONFIRM_TOKEN_DIGEST) is required in live mode",
+            )?;
+
+            run_live_mode(
+                &spec,
+                &computed,
+                &run_id,
+                args.exchange.into(),
+                creds,
+                LiveModeConfig {
+                    user_id,
+                    account_id,
+                    confirm_token,
+                    confirm_token_digest,
+                    compliance,
+                    flatten_on_kill_switch: args.flatten_on_kill_switch,
+                    audit_log_dir: args.audit_log_dir.clone(),
+                    state_dir: args.state_dir.clone(),
+                    live_smoke: args.live_smoke,
+                    live_smoke_quote_cap: args.live_smoke_quote_cap,
+                    dry_run: args.dry_run,
+                },
+            )
+            .await?;
         }
     }
     Ok(())
@@ -675,6 +847,1162 @@ fn metrics_json(metrics: &ValidationMetrics) -> Value {
     })
 }
 
+// ---- Phase 6: Live Mode + Safeguards ----
+
+fn parse_broker_key_scope(raw_scopes: &[String]) -> Result<Vec<String>> {
+    let scopes: Vec<String> = raw_scopes
+        .iter()
+        .map(|scope| scope.trim().to_ascii_lowercase())
+        .filter(|scope| !scope.is_empty())
+        .collect();
+
+    if scopes.is_empty() {
+        anyhow::bail!(
+            "--broker-key-scope (EXEC_BROKER_KEY_SCOPE) is required in live mode; pass trusted stored broker-key metadata"
+        );
+    }
+
+    Ok(scopes)
+}
+
+#[derive(Debug, Clone)]
+struct LiveModeConfig {
+    user_id: String,
+    account_id: String,
+    confirm_token: String,
+    confirm_token_digest: String,
+    compliance: ComplianceRecord,
+    flatten_on_kill_switch: bool,
+    audit_log_dir: std::path::PathBuf,
+    #[allow(dead_code)]
+    state_dir: std::path::PathBuf,
+    live_smoke: bool,
+    live_smoke_quote_cap: Decimal,
+    dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExchangeOrderResponse {
+    #[serde(rename = "orderId")]
+    order_id: u64,
+    symbol: String,
+    side: String,
+    #[serde(rename = "executedQty")]
+    executed_qty: String,
+    #[serde(rename = "cummulativeQuoteQty")]
+    cumulative_quote_qty: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceErrorResponse {
+    code: i64,
+    #[allow(dead_code)]
+    msg: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceTickerPriceResponse {
+    price: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceExchangeInfoResponse {
+    symbols: Vec<BinanceExchangeSymbol>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceExchangeSymbol {
+    symbol: String,
+    filters: Vec<BinanceSymbolFilter>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceSymbolFilter {
+    #[serde(rename = "filterType")]
+    filter_type: String,
+    #[serde(rename = "stepSize")]
+    step_size: Option<String>,
+    #[serde(rename = "minQty")]
+    min_qty: Option<String>,
+    #[serde(rename = "minNotional")]
+    min_notional: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SymbolTradingFilters {
+    step_size: Decimal,
+    min_qty: Decimal,
+    min_notional: Decimal,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceAccountResponse {
+    balances: Vec<BinanceBalance>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BinanceBalance {
+    asset: String,
+    free: String,
+}
+
+struct LiveBroker {
+    http: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    api_secret: String,
+}
+
+impl LiveBroker {
+    fn new(base_url: impl Into<String>, api_key: String, api_secret: String) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base_url: base_url.into(),
+            api_key,
+            api_secret,
+        }
+    }
+
+    fn sign(&self, params: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(self.api_secret.as_bytes())
+            .expect("HMAC accepts any key size");
+        mac.update(params.as_bytes());
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    fn timestamp_ms() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+
+    async fn place_market_order(
+        &self,
+        symbol: &str,
+        side: Side,
+        qty: Decimal,
+        client_order_id: uuid::Uuid,
+    ) -> Result<ExchangeOrderResponse> {
+        let ts = Self::timestamp_ms();
+        let params = format!(
+            "symbol={}&side={}&type=MARKET&quantity={}&newClientOrderId={}&timestamp={}",
+            symbol,
+            side.as_str(),
+            qty,
+            client_order_id.simple(),
+            ts
+        );
+        let sig = self.sign(&params);
+        let url = format!(
+            "{}/api/v3/order?{}&signature={}",
+            self.base_url, params, sig
+        );
+
+        let resp = self
+            .http
+            .post(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("POST /api/v3/order")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("order placement failed ({}): {}", status, body);
+        }
+        resp.json::<ExchangeOrderResponse>()
+            .await
+            .context("parse order response")
+    }
+
+    async fn cancel_all_open_orders(&self, symbol: &str) -> Result<usize> {
+        let ts = Self::timestamp_ms();
+        let params = format!("symbol={}&timestamp={}", symbol, ts);
+        let sig = self.sign(&params);
+        let url = format!(
+            "{}/api/v3/openOrders?{}&signature={}",
+            self.base_url, params, sig
+        );
+
+        let resp = self
+            .http
+            .delete(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("DELETE /api/v3/openOrders")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            // Binance uses HTTP 400 for many signed-request failures. Only the exact
+            // no-such-order code is safe to suppress during cancel-all.
+            if status.as_u16() == 400 && binance_error_code(&body) == Some(-2011) {
+                return Ok(0);
+            }
+            anyhow::bail!("cancel-all failed ({}): {}", status, body);
+        }
+        let cancelled: Vec<Value> = resp.json().await.context("parse cancel-all response")?;
+        Ok(cancelled.len())
+    }
+
+    async fn ticker_price(&self, symbol: &str) -> Result<Decimal> {
+        let url = format!("{}/api/v3/ticker/price?symbol={}", self.base_url, symbol);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("GET /api/v3/ticker/price")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("ticker price failed ({}): {}", status, body);
+        }
+
+        let payload = resp
+            .json::<BinanceTickerPriceResponse>()
+            .await
+            .context("parse ticker price")?;
+        Decimal::from_str_exact(&payload.price).context("parse ticker price decimal")
+    }
+
+    async fn symbol_trading_filters(&self, symbol: &str) -> Result<SymbolTradingFilters> {
+        let url = format!("{}/api/v3/exchangeInfo?symbol={}", self.base_url, symbol);
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("GET /api/v3/exchangeInfo")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("exchangeInfo failed ({}): {}", status, body);
+        }
+
+        let payload = resp
+            .json::<BinanceExchangeInfoResponse>()
+            .await
+            .context("parse exchangeInfo")?;
+        let symbol_info = payload
+            .symbols
+            .into_iter()
+            .find(|info| info.symbol == symbol)
+            .with_context(|| format!("exchangeInfo missing symbol {symbol}"))?;
+
+        let lot_size = symbol_info
+            .filters
+            .iter()
+            .find(|filter| filter.filter_type == "LOT_SIZE")
+            .with_context(|| format!("exchangeInfo missing LOT_SIZE for {symbol}"))?;
+        let step_size = lot_size
+            .step_size
+            .as_deref()
+            .context("LOT_SIZE missing stepSize")
+            .and_then(|value| Decimal::from_str_exact(value).context("parse stepSize"))?;
+        let min_qty = lot_size
+            .min_qty
+            .as_deref()
+            .context("LOT_SIZE missing minQty")
+            .and_then(|value| Decimal::from_str_exact(value).context("parse minQty"))?;
+
+        let min_notional = symbol_info
+            .filters
+            .iter()
+            .find(|filter| filter.filter_type == "MIN_NOTIONAL" || filter.filter_type == "NOTIONAL")
+            .and_then(|filter| filter.min_notional.as_deref())
+            .map(Decimal::from_str_exact)
+            .transpose()
+            .context("parse minNotional")?
+            .unwrap_or(Decimal::ZERO);
+
+        anyhow::ensure!(
+            step_size > Decimal::ZERO,
+            "exchangeInfo stepSize must be positive"
+        );
+        anyhow::ensure!(
+            min_qty >= Decimal::ZERO,
+            "exchangeInfo minQty must be non-negative"
+        );
+        anyhow::ensure!(
+            min_notional >= Decimal::ZERO,
+            "exchangeInfo minNotional must be non-negative"
+        );
+
+        Ok(SymbolTradingFilters {
+            step_size,
+            min_qty,
+            min_notional,
+        })
+    }
+
+    async fn free_balance(&self, asset: &str) -> Result<Decimal> {
+        let ts = Self::timestamp_ms();
+        let params = format!("timestamp={}", ts);
+        let sig = self.sign(&params);
+        let url = format!(
+            "{}/api/v3/account?{}&signature={}",
+            self.base_url, params, sig
+        );
+
+        let resp = self
+            .http
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("GET /api/v3/account")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("account balance failed ({}): {}", status, body);
+        }
+
+        let payload = resp
+            .json::<BinanceAccountResponse>()
+            .await
+            .context("parse account balance")?;
+        let free = payload
+            .balances
+            .into_iter()
+            .find(|balance| balance.asset == asset)
+            .map(|balance| balance.free)
+            .unwrap_or_else(|| "0".to_string());
+        Decimal::from_str_exact(&free).context("parse free balance")
+    }
+
+    async fn get_order_status(
+        &self,
+        symbol: &str,
+        client_order_id: uuid::Uuid,
+    ) -> Result<Option<ExchangeOrderResponse>> {
+        let ts = Self::timestamp_ms();
+        let params = format!(
+            "symbol={}&origClientOrderId={}&timestamp={}",
+            symbol,
+            client_order_id.simple(),
+            ts
+        );
+        let sig = self.sign(&params);
+        let url = format!(
+            "{}/api/v3/order?{}&signature={}",
+            self.base_url, params, sig
+        );
+
+        let resp = self
+            .http
+            .get(&url)
+            .header("X-MBX-APIKEY", &self.api_key)
+            .send()
+            .await
+            .context("GET /api/v3/order")?;
+
+        if resp.status().as_u16() == 404 {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("get order status failed ({}): {}", status, body);
+        }
+        Ok(Some(
+            resp.json::<ExchangeOrderResponse>()
+                .await
+                .context("parse order status")?,
+        ))
+    }
+}
+
+fn binance_error_code(body: &str) -> Option<i64> {
+    serde_json::from_str::<BinanceErrorResponse>(body)
+        .ok()
+        .map(|err| err.code)
+}
+
+fn install_kill_switch_signal_handler() -> Arc<AtomicBool> {
+    let kill_flag = Arc::new(AtomicBool::new(false));
+    let kf = kill_flag.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("register SIGTERM handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await.ok();
+        kf.store(true, Ordering::SeqCst);
+        tracing::warn!("kill-switch: signal received");
+    });
+    kill_flag
+}
+
+fn check_live_smoke_kill_switch(kill_flag: &AtomicBool) -> Result<()> {
+    if kill_flag.load(Ordering::SeqCst) {
+        anyhow::bail!("live smoke interrupted by kill-switch signal");
+    }
+    Ok(())
+}
+
+fn floor_to_step(value: Decimal, step_size: Decimal) -> Result<Decimal> {
+    if step_size <= Decimal::ZERO {
+        anyhow::bail!("step size must be positive");
+    }
+
+    Ok((value / step_size).trunc() * step_size)
+}
+
+fn calculate_live_smoke_qty(
+    quote_cap: Decimal,
+    reference_price: Decimal,
+    filters: SymbolTradingFilters,
+) -> Result<Decimal> {
+    if quote_cap <= Decimal::ZERO {
+        anyhow::bail!("live smoke quote cap must be positive");
+    }
+    if reference_price <= Decimal::ZERO {
+        anyhow::bail!("live smoke reference price must be positive");
+    }
+
+    let qty = floor_to_step(quote_cap * dec!(0.95) / reference_price, filters.step_size)?;
+
+    if qty <= Decimal::ZERO {
+        anyhow::bail!(
+            "live smoke quote cap {} is too small for reference price {}",
+            quote_cap,
+            reference_price
+        );
+    }
+    if qty < filters.min_qty {
+        anyhow::bail!(
+            "live smoke quantity {} is below exchange minQty {}",
+            qty,
+            filters.min_qty
+        );
+    }
+    if qty * reference_price < filters.min_notional {
+        anyhow::bail!(
+            "live smoke notional {} is below exchange minNotional {}",
+            qty * reference_price,
+            filters.min_notional
+        );
+    }
+
+    Ok(qty)
+}
+
+fn parse_exchange_executed_qty(order: &ExchangeOrderResponse, context: &str) -> Result<Decimal> {
+    Decimal::from_str_exact(&order.executed_qty)
+        .with_context(|| format!("{context}: parse executedQty {}", order.executed_qty))
+}
+
+async fn run_live_mode(
+    spec: &Value,
+    spec_hash: &str,
+    run_id: &str,
+    exchange: Exchange,
+    creds: BrokerCredentials,
+    config: LiveModeConfig,
+) -> Result<()> {
+    // 1. Scope enforcement: no withdraw, must have trade.
+    creds
+        .verify_scope()
+        .context("broker credential scope check")?;
+
+    // 2. Jurisdiction + ToS + risk-ack gate.
+    check_compliance_gate(&config.compliance).map_err(|e| match e {
+        ComplianceError::NoJurisdiction => {
+            anyhow::anyhow!("{e}; set EXEC_JURISDICTION before going live")
+        }
+        ComplianceError::TosNotAccepted => {
+            anyhow::anyhow!("{e}; user must accept counsel-reviewed disclosures first")
+        }
+        ComplianceError::RiskAckMissing => {
+            anyhow::anyhow!("{e}; user must complete the risk acknowledgement flow")
+        }
+    })?;
+
+    // 3. Hold-to-confirm: verify against the server-recorded confirmation digest.
+    if !ConfirmationGate::verify(&config.confirm_token, &config.confirm_token_digest) {
+        anyhow::bail!(
+            "confirmation token mismatch for live session \
+             (spec_hash={spec_hash}, account_id={}, exchange={}); request a new confirmation token",
+            config.account_id,
+            exchange.as_str()
+        );
+    }
+
+    if matches!(exchange, Exchange::Bybit) {
+        anyhow::bail!(
+            "phase 6 live/dry-run execution supports only binance; use --exchange binance"
+        );
+    }
+
+    // 4. Audit log setup.
+    std::fs::create_dir_all(&config.audit_log_dir)
+        .with_context(|| format!("create audit log dir {}", config.audit_log_dir.display()))?;
+    let audit = AuditLog::new(&config.audit_log_dir, run_id);
+
+    let base_entry = AuditEntry {
+        ts: chrono::Utc::now(),
+        user_id: config.user_id.clone(),
+        run_id: run_id.to_string(),
+        spec_hash: spec_hash.to_string(),
+        exchange,
+        action: String::new(),
+        payload: json!({}),
+        result: "ok".to_string(),
+    };
+
+    audit
+        .write(&AuditEntry {
+            action: "go_live".to_string(),
+            payload: json!({
+                "dry_run": config.dry_run,
+                "live_smoke": config.live_smoke,
+                "live_smoke_quote_cap": config.live_smoke_quote_cap.to_string(),
+                "flatten_on_kill_switch": config.flatten_on_kill_switch,
+                "exchange": exchange.as_str(),
+                "account_id": config.account_id,
+            }),
+            ..base_entry.clone()
+        })
+        .context("write go_live audit entry")?;
+
+    tracing::info!(
+        run_id = %run_id,
+        spec_hash = %spec_hash,
+        exchange = exchange.as_str(),
+        account_id = %config.account_id,
+        dry_run = config.dry_run,
+        "live mode: compliance gate passed; confirmation token verified"
+    );
+
+    if config.dry_run {
+        tracing::info!("dry-run: all pre-flight checks passed; no orders will be placed");
+        audit
+            .write(&AuditEntry {
+                action: "dry_run_complete".to_string(),
+                ..base_entry.clone()
+            })
+            .context("write dry_run_complete audit entry")?;
+        return Ok(());
+    }
+
+    // 5. Kill-switch signal handler (SIGTERM / Ctrl-C -> atomic flag).
+    let kill_flag = install_kill_switch_signal_handler();
+
+    // 6. Live broker.
+    let base_url = match exchange {
+        Exchange::Binance => "https://api.binance.com",
+        Exchange::Bybit => unreachable!("bybit live mode is rejected before broker construction"),
+    };
+    let broker = LiveBroker::new(base_url, creds.api_key.clone(), creds.api_secret.clone());
+
+    // 7. Local risk cache: fail-closed if unreachable for > 5 minutes.
+    let risk_cache = LocalRiskCache::new(
+        RiskLimits {
+            kill_switch_active: false,
+            max_daily_loss_pct: dec!(2),
+            max_position_pct: dec!(5),
+            max_concurrent_orders: 5,
+        },
+        300,
+    );
+
+    // 8. Single round-trip smoke test (Verify: $50 sub-account).
+    if config.live_smoke {
+        let mut positions = LivePositionState::default();
+        let smoke_result = run_live_smoke(
+            &base_entry,
+            &broker,
+            &mut positions,
+            &audit,
+            &config,
+            &kill_flag,
+        )
+        .await;
+        if let Err(err) = smoke_result {
+            if !positions.is_flat() {
+                let action = KillSwitchAction::new(
+                    config.flatten_on_kill_switch,
+                    format!("live smoke aborted before flattening: {err}"),
+                );
+                execute_kill_switch(
+                    &action,
+                    &broker,
+                    &positions,
+                    &OrderOutbox::default(),
+                    &audit,
+                    &base_entry,
+                )
+                .await?;
+            }
+            return Err(err);
+        }
+        return Ok(());
+    }
+
+    if !config.live_smoke {
+        audit
+            .write(&AuditEntry {
+                action: "live_strategy_rejected".to_string(),
+                payload: json!({
+                    "reason": "non-smoke live strategy execution is not wired to the strategy interpreter",
+                    "use_live_smoke": true,
+                }),
+                result: "rejected".to_string(),
+                ..base_entry.clone()
+            })
+            .context("write live_strategy_rejected audit entry")?;
+        anyhow::bail!(
+            "non-smoke live strategy execution is not supported yet; use --dry-run for pre-flight checks or --live-smoke for the Phase 6 broker round-trip"
+        );
+    }
+
+    // 9. Main live loop (strategy interpreter consumed in Phase 4; Phase 6 wires the harness).
+    let positions = LivePositionState::default();
+    let outbox = OrderOutbox::default();
+    let symbol = spec
+        .get("symbols")
+        .and_then(Value::as_array)
+        .and_then(|s| s.first())
+        .and_then(Value::as_str)
+        .unwrap_or("BTCUSDT");
+
+    let mut ws = connect_market_ws(exchange, symbol).await?;
+    let mut next_heartbeat = Instant::now();
+
+    loop {
+        // Check kill-switch flag.
+        if kill_flag.load(Ordering::SeqCst) {
+            let action = KillSwitchAction::new(config.flatten_on_kill_switch, "signal received");
+            execute_kill_switch(&action, &broker, &positions, &outbox, &audit, &base_entry).await?;
+            break;
+        }
+
+        // Fail-closed: activate kill-switch if risk cache is stale.
+        let effective = risk_cache.effective_limits();
+        if effective.kill_switch_active {
+            let action = KillSwitchAction::new(
+                config.flatten_on_kill_switch,
+                "risk cache stale — fail closed",
+            );
+            execute_kill_switch(&action, &broker, &positions, &outbox, &audit, &base_entry).await?;
+            break;
+        }
+
+        let guard = RiskGuard::new(effective);
+        let risk_state = RiskState {
+            equity: positions.equity,
+            start_of_day_equity: positions.start_of_day_equity,
+            gross_position_pct: positions.gross_position_pct(),
+            open_orders: outbox.pending_for_reconciliation().len(),
+        };
+        if let Err(alert) = guard.check(&risk_state) {
+            tracing::warn!(alert = ?alert, "risk guard breached; triggering kill-switch");
+            let action = KillSwitchAction::new(
+                config.flatten_on_kill_switch,
+                format!("risk guard: {alert:?}"),
+            );
+            execute_kill_switch(&action, &broker, &positions, &outbox, &audit, &base_entry).await?;
+            break;
+        }
+
+        tokio::select! {
+            msg = ws.next() => {
+                match msg {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        if parse_trade_tick(exchange, symbol, &text).is_some() {
+                            anyhow::bail!(
+                                "non-smoke live strategy execution is not supported yet; refusing to ignore live market ticks"
+                            );
+                        }
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(p))) => {
+                        ws.send(tokio_tungstenite::tungstenite::Message::Pong(p)).await.ok();
+                    }
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => {
+                        tracing::warn!("market WS closed; reconnecting");
+                        ws = connect_market_ws(exchange, symbol).await?;
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "market WS error; reconnecting");
+                        ws = connect_market_ws(exchange, symbol).await?;
+                    }
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep_until(next_heartbeat) => {
+                tracing::info!(
+                    run_id = %run_id,
+                    open_positions = positions.open_symbols().len(),
+                    pending_outbox = outbox.pending_for_reconciliation().len(),
+                    "live heartbeat"
+                );
+                audit.write(&AuditEntry {
+                    action: "heartbeat".to_string(),
+                    payload: json!({
+                        "open_positions": positions.open_symbols().len(),
+                        "pending_outbox": outbox.pending_for_reconciliation().len(),
+                    }),
+                    ..base_entry.clone()
+                }).ok();
+                next_heartbeat = Instant::now() + Duration::from_secs(60);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn execute_kill_switch(
+    action: &KillSwitchAction,
+    broker: &LiveBroker,
+    positions: &LivePositionState,
+    outbox: &OrderOutbox,
+    audit: &AuditLog,
+    base_entry: &AuditEntry,
+) -> Result<()> {
+    tracing::warn!(
+        reason = %action.reason,
+        flatten = action.flatten_positions,
+        "kill-switch activated; cancelling all open orders"
+    );
+
+    let mut cancelled = 0usize;
+    for symbol in kill_switch_cancel_symbols(positions, outbox) {
+        match broker.cancel_all_open_orders(&symbol).await {
+            Ok(n) => {
+                cancelled += n;
+                tracing::info!(symbol = %symbol, cancelled = n, "cancelled open orders");
+            }
+            Err(e) => tracing::error!(symbol = %symbol, error = %e, "cancel-all failed"),
+        }
+    }
+
+    let mut flatten_errors = 0usize;
+    if action.flatten_positions {
+        for (symbol, &qty) in &positions.positions {
+            if let Some((side, flatten_qty)) = flatten_order_for_position(qty) {
+                let intent_id = format!("ks-flatten-{symbol}");
+                let client_order_id =
+                    deterministic_client_order_id(&base_entry.spec_hash, &intent_id);
+                match broker
+                    .place_market_order(symbol, side, flatten_qty, client_order_id)
+                    .await
+                {
+                    Ok(resp) => {
+                        tracing::info!(
+                            symbol = %symbol,
+                            side = side.as_str(),
+                            qty = %flatten_qty,
+                            order_id = resp.order_id,
+                            "flatten order placed"
+                        );
+                    }
+                    Err(e) => {
+                        flatten_errors += 1;
+                        tracing::error!(symbol = %symbol, error = %e, "flatten order failed");
+                    }
+                }
+            }
+        }
+    }
+
+    audit
+        .write(&AuditEntry {
+            action: "kill_switch".to_string(),
+            payload: json!({
+                "reason": action.reason,
+                "cancel_all": action.cancel_all,
+                "flatten_positions": action.flatten_positions,
+                "cancelled_orders": cancelled,
+                "flatten_errors": flatten_errors,
+            }),
+            result: if flatten_errors == 0 {
+                "ok".to_string()
+            } else {
+                format!("{flatten_errors} flatten error(s)")
+            },
+            ..base_entry.clone()
+        })
+        .context("write kill_switch audit entry")?;
+
+    Ok(())
+}
+
+fn kill_switch_cancel_symbols(
+    positions: &LivePositionState,
+    outbox: &OrderOutbox,
+) -> std::collections::BTreeSet<String> {
+    positions
+        .open_symbols()
+        .into_iter()
+        .chain(outbox.open_order_symbols())
+        .collect()
+}
+
+fn flatten_order_for_position(qty: Decimal) -> Option<(Side, Decimal)> {
+    match qty.cmp(&Decimal::ZERO) {
+        std::cmp::Ordering::Greater => Some((Side::Sell, qty)),
+        std::cmp::Ordering::Less => Some((Side::Buy, qty.abs())),
+        std::cmp::Ordering::Equal => None,
+    }
+}
+
+async fn run_live_smoke(
+    base_entry: &AuditEntry,
+    broker: &LiveBroker,
+    positions: &mut LivePositionState,
+    audit: &AuditLog,
+    config: &LiveModeConfig,
+    kill_flag: &AtomicBool,
+) -> Result<()> {
+    tracing::info!(
+        "live smoke: single round-trip on {}",
+        base_entry.exchange.as_str()
+    );
+
+    let symbol = "BTCUSDT";
+    let reference_price = broker
+        .ticker_price(symbol)
+        .await
+        .context("live smoke: fetch reference price")?;
+    let filters = broker
+        .symbol_trading_filters(symbol)
+        .await
+        .context("live smoke: fetch symbol trading filters")?;
+    let qty = calculate_live_smoke_qty(config.live_smoke_quote_cap, reference_price, filters)
+        .context("live smoke: calculate quote-capped quantity")?;
+    let pre_buy_free_base = broker
+        .free_balance("BTC")
+        .await
+        .context("live smoke: fetch free base balance before buy")?;
+
+    tracing::info!(
+        symbol,
+        quote_cap = %config.live_smoke_quote_cap,
+        reference_price = %reference_price,
+        qty = %qty,
+        "live smoke: calculated quote-capped buy quantity"
+    );
+
+    // Step 1: Place market buy.
+    check_live_smoke_kill_switch(kill_flag)?;
+    let buy_coid = deterministic_client_order_id(
+        &base_entry.spec_hash,
+        &format!("smoke-buy-{}", base_entry.run_id),
+    );
+    let buy = broker
+        .place_market_order(symbol, Side::Buy, qty, buy_coid)
+        .await
+        .context("live smoke: place buy order")?;
+
+    tracing::info!(
+        order_id = buy.order_id,
+        client_order_id = %buy_coid,
+        status = %buy.status,
+        executed_qty = %buy.executed_qty,
+        "live smoke: buy filled"
+    );
+
+    let exec_qty = parse_exchange_executed_qty(&buy, "live smoke: buy response")?;
+    positions.update_fill(symbol, Side::Buy, exec_qty);
+
+    audit
+        .write(&AuditEntry {
+            action: "live_smoke_buy".to_string(),
+            payload: json!({
+                "order_id": buy.order_id,
+                "client_order_id": buy_coid.to_string(),
+                "symbol": symbol,
+                "qty": qty.to_string(),
+                "executed_qty": buy.executed_qty,
+                "status": buy.status,
+                "cumulative_quote_qty": buy.cumulative_quote_qty,
+            }),
+            ..base_entry.clone()
+        })
+        .context("write live_smoke_buy audit entry")?;
+    check_live_smoke_kill_switch(kill_flag)?;
+
+    // Step 2: Reconcile buy against exchange order status.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    check_live_smoke_kill_switch(kill_flag)?;
+
+    let status = broker
+        .get_order_status(symbol, buy_coid)
+        .await?
+        .with_context(|| format!("live smoke: broker status missing for buy order {buy_coid}"))?;
+    let ex_qty = Decimal::from_str_exact(&status.executed_qty).unwrap_or(Decimal::ZERO);
+    let ex_price = if ex_qty > Decimal::ZERO {
+        Decimal::from_str_exact(&status.cumulative_quote_qty).unwrap_or(Decimal::ZERO) / ex_qty
+    } else {
+        Decimal::ZERO
+    };
+
+    let check = ReconciliationCheck {
+        client_order_id: buy_coid,
+        local_symbol: symbol.to_string(),
+        local_side: Side::Buy,
+        local_qty: exec_qty,
+        local_price: ex_price,
+        exchange_symbol: status.symbol.clone(),
+        exchange_side: if status.side == "BUY" {
+            Side::Buy
+        } else {
+            Side::Sell
+        },
+        exchange_qty: ex_qty,
+        exchange_price: ex_price,
+    };
+
+    let recon = reconcile_fill(&check, dec!(50));
+
+    audit
+        .write(&AuditEntry {
+            action: "reconciliation".to_string(),
+            payload: json!({
+                "client_order_id": buy_coid.to_string(),
+                "matched": recon.is_matched(),
+                "result": format!("{recon:?}"),
+                "broker_status": status.status,
+            }),
+            result: if recon.is_matched() { "ok" } else { "mismatch" }.to_string(),
+            ..base_entry.clone()
+        })
+        .context("write reconciliation audit entry")?;
+
+    tracing::info!(matched = recon.is_matched(), result = ?recon, "live smoke: reconciliation");
+    if !recon.is_matched() {
+        anyhow::bail!("live smoke reconciliation mismatch: {recon:?}");
+    }
+    check_live_smoke_kill_switch(kill_flag)?;
+
+    // Step 3: Close position with a sellable free balance, accounting for base-asset fees.
+    let post_buy_free_base = broker
+        .free_balance("BTC")
+        .await
+        .context("live smoke: fetch free base balance before close")?;
+    let sellable_delta = if post_buy_free_base > pre_buy_free_base {
+        post_buy_free_base - pre_buy_free_base
+    } else {
+        Decimal::ZERO
+    };
+    let sell_qty = floor_to_step(exec_qty.min(sellable_delta), filters.step_size)
+        .context("live smoke: calculate sellable close quantity")?;
+    if sell_qty < filters.min_qty {
+        anyhow::bail!(
+            "live smoke sellable quantity {} is below exchange minQty {}; pre_buy_free_base={}, post_buy_free_base={}, executed_qty={}",
+            sell_qty,
+            filters.min_qty,
+            pre_buy_free_base,
+            post_buy_free_base,
+            exec_qty
+        );
+    }
+    if sell_qty * reference_price < filters.min_notional {
+        anyhow::bail!(
+            "live smoke sell notional {} is below exchange minNotional {}; pre_buy_free_base={}, post_buy_free_base={}, executed_qty={}",
+            sell_qty * reference_price,
+            filters.min_notional,
+            pre_buy_free_base,
+            post_buy_free_base,
+            exec_qty
+        );
+    }
+    if sell_qty < exec_qty {
+        positions.update_fill(symbol, Side::Sell, exec_qty - sell_qty);
+    }
+
+    let sell_coid = deterministic_client_order_id(
+        &base_entry.spec_hash,
+        &format!("smoke-sell-{}", base_entry.run_id),
+    );
+    check_live_smoke_kill_switch(kill_flag)?;
+    let sell = broker
+        .place_market_order(symbol, Side::Sell, sell_qty, sell_coid)
+        .await
+        .context("live smoke: place sell order")?;
+
+    let final_sell = if sell.status == "FILLED" {
+        sell
+    } else {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        broker
+            .get_order_status(symbol, sell_coid)
+            .await?
+            .with_context(|| {
+                format!("live smoke: broker status missing for sell order {sell_coid}")
+            })?
+    };
+    let executed_sell_qty = parse_exchange_executed_qty(&final_sell, "live smoke: sell response")?;
+    if executed_sell_qty > Decimal::ZERO {
+        positions.update_fill(symbol, Side::Sell, executed_sell_qty);
+    }
+
+    tracing::info!(
+        order_id = final_sell.order_id,
+        status = %final_sell.status,
+        requested_qty = %sell_qty,
+        executed_qty = %executed_sell_qty,
+        "live smoke: sell status received"
+    );
+
+    audit
+        .write(&AuditEntry {
+            action: "live_smoke_sell".to_string(),
+            payload: json!({
+                "order_id": final_sell.order_id,
+                "client_order_id": sell_coid.to_string(),
+                "status": final_sell.status.clone(),
+                "sell_qty": sell_qty.to_string(),
+                "executed_sell_qty": executed_sell_qty.to_string(),
+                "pre_buy_free_base": pre_buy_free_base.to_string(),
+                "post_buy_free_base": post_buy_free_base.to_string(),
+                "sellable_delta": sellable_delta.to_string(),
+                "executed_buy_qty": exec_qty.to_string(),
+            }),
+            ..base_entry.clone()
+        })
+        .context("write live_smoke_sell audit entry")?;
+
+    anyhow::ensure!(
+        final_sell.status == "FILLED",
+        "live smoke sell order ended with status {} after executing {} of requested {}",
+        final_sell.status,
+        executed_sell_qty,
+        sell_qty
+    );
+    anyhow::ensure!(
+        executed_sell_qty >= sell_qty,
+        "live smoke sell executed {} below requested {}; position left open: {:?}",
+        executed_sell_qty,
+        sell_qty,
+        positions.positions
+    );
+    anyhow::ensure!(
+        positions.is_flat(),
+        "live smoke complete but position not flat: {:?}",
+        positions.positions
+    );
+
+    tracing::info!(
+        run_id = %base_entry.run_id,
+        "live smoke: round-trip complete; position flat; broker statement reconciled"
+    );
+
+    Ok(())
+}
+
 fn decimal_number(value: Decimal) -> f64 {
     value.to_string().parse::<f64>().unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_switch_cancel_symbols_include_outbox_only_symbols() {
+        let mut positions = LivePositionState::default();
+        positions.update_fill("ETHUSDT", Side::Buy, dec!(0.5));
+
+        let mut outbox = OrderOutbox::default();
+        outbox.enqueue(
+            &"f".repeat(64),
+            OrderIntent {
+                intent_id: "entry-btc".to_string(),
+                symbol: "BTCUSDT".to_string(),
+                side: Side::Buy,
+                qty: dec!(0.01),
+            },
+        );
+
+        let symbols = kill_switch_cancel_symbols(&positions, &outbox);
+        assert!(symbols.contains("BTCUSDT"));
+        assert!(symbols.contains("ETHUSDT"));
+    }
+
+    #[test]
+    fn flatten_order_buys_abs_quantity_for_short_positions() {
+        assert_eq!(
+            flatten_order_for_position(dec!(2)),
+            Some((Side::Sell, dec!(2)))
+        );
+        assert_eq!(
+            flatten_order_for_position(dec!(-3)),
+            Some((Side::Buy, dec!(3)))
+        );
+        assert_eq!(flatten_order_for_position(Decimal::ZERO), None);
+    }
+
+    #[test]
+    fn binance_cancel_all_suppresses_only_no_such_order_code() {
+        assert_eq!(
+            binance_error_code(r#"{"code":-2011,"msg":"Unknown order sent."}"#),
+            Some(-2011)
+        );
+        assert_ne!(
+            binance_error_code(
+                r#"{"code":-1022,"msg":"Signature for this request is not valid."}"#
+            ),
+            Some(-2011)
+        );
+        assert_eq!(binance_error_code("not-json"), None);
+    }
+
+    #[test]
+    fn broker_key_scope_is_required_from_metadata() {
+        assert!(parse_broker_key_scope(&[]).is_err());
+        assert_eq!(
+            parse_broker_key_scope(&[" Trade ".to_string(), "read".to_string()]).unwrap(),
+            vec!["trade".to_string(), "read".to_string()]
+        );
+    }
+
+    #[test]
+    fn live_smoke_quantity_uses_quote_cap_with_buffer() {
+        let filters = SymbolTradingFilters {
+            step_size: dec!(0.00001000),
+            min_qty: dec!(0.00001000),
+            min_notional: dec!(5),
+        };
+
+        let qty = calculate_live_smoke_qty(dec!(45), dec!(55000), filters).unwrap();
+        assert_eq!(qty, dec!(0.00077000));
+        assert!(qty * dec!(55000) < dec!(45));
+        assert!(calculate_live_smoke_qty(dec!(0), dec!(55000), filters).is_err());
+        assert!(calculate_live_smoke_qty(dec!(45), dec!(0), filters).is_err());
+    }
+
+    #[test]
+    fn live_smoke_quantity_rejects_exchange_filter_violations() {
+        let filters = SymbolTradingFilters {
+            step_size: dec!(0.00001000),
+            min_qty: dec!(0.001),
+            min_notional: dec!(5),
+        };
+
+        assert!(calculate_live_smoke_qty(dec!(45), dec!(55000), filters).is_err());
+        assert_eq!(
+            floor_to_step(dec!(0.000777), dec!(0.00001000)).unwrap(),
+            dec!(0.00077000)
+        );
+    }
 }

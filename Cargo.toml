@@ -27,6 +27,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 uuid = { version = "1.11", features = ["v5", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+aes-gcm = "0.10"
+hmac = "0.12"
 
 [profile.release]
 lto = "thin"
